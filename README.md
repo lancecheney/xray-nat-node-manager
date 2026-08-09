@@ -4,7 +4,7 @@
 
 - HY2 直连：客户端直接进入新节点。
 - HY2 中转落地：供任意中转服务器接入，不绑定特定国家或机器。
-- VLESS + Reality：使用 RAW、XTLS Vision、Chrome 指纹和独立 Reality 密钥。
+- VLESS + Reality：使用 TCP/RAW、XTLS Vision、Chrome 指纹和独立 Reality 密钥。
 - 各节点使用独立的认证、服务、配置、日志和统计 API。
 - QUIC 拥塞控制固定为 BBR `standard`，窗口沿用已验证的 8/20 MiB。
 
@@ -41,6 +41,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写节点与 Agent 端口。随后选择 `2`，按需创建“HY2 直连”“HY2 中转落地（供中转接入）”或“VLESS + Reality”独立服务；选择 `5` 再设置 Agent。Agent 接入 3x-ui 总面板后，已有入站和客户端统一在总面板调整，脚本不再提供重复的节点修改入口。以后需要增加尚未创建的节点类型，仍可通过 `2` 创建；公网外部端口映射始终由 NAT 服务商后台管理。
 
 两条 HY2 当前保持为两个独立 Xray 服务，因此不能共用同一个内部 UDP 端口；若合并成单个入站才可通过不同认证用户共用端口。VLESS Reality 使用 TCP，HY2 使用 UDP，所以二者可以使用相同的端口数字，但 NAT 面板必须分别建立 TCP 与 UDP 映射。
+
+创建 VLESS Reality 时不要求手填伪装目标。脚本先解析当前节点入口 IPv4，并明确询问是否从本机扫描其所在的最小 `/27`（32 个地址、仅 TCP 443）。扫描结果必须同时通过 TLS 1.3、H2、证书主机名、DNS 与扫描 IP 一致，以及三轮握手稳定性复验；不合格时再对美国机和台湾奶爸已使用过的成熟目标集合进行同样实测。脚本使用得分最低的合格域名，不把扫描 IP 固定为 Reality `target`，也不会自动扩大到 `/24`。云服务器主动扫描可能触发服务商风控，因此扫描前必须由用户确认。
+
+Reality 默认值与现有美国机和台湾奶爸保持一致：`flow=xtls-rprx-vision`、Chrome 指纹、独立 UUID/X25519 密钥/Short ID/SpiderX，且 `minClientVer=1.0.0`。服务器只能验证目标从节点侧可用；创建后仍需从实际客户端网络测试连接。
 
 在节点地址问题之前，程序会显示 `[0/3] Linux TCP BBR`。判断以 `net.ipv4.tcp_congestion_control` 的实时值为准，不使用可能漏报内核内置功能的 `lsmod | grep bbr`。如果 NAT/LXC 无权修改宿主内核，程序会恢复原配置、说明原因并继续安装。Linux TCP BBR 只影响 TCP；HY2 使用的是 Xray 内部独立配置的 QUIC BBR `standard`。
 

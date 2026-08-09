@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import concurrent.futures
 import getpass
 import hashlib
 import io
@@ -14,11 +15,14 @@ import platform
 import re
 import secrets
 import shutil
+import socket
 import ssl
+import statistics
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -79,6 +83,25 @@ SERVICE_SPECS = {
         "uses_tls_cert": False,
     },
 }
+REALITY_FALLBACK_TARGETS = (
+    "www.kernel.org",
+    "www.debian.org",
+    "www.python.org",
+    "www.cht.com.tw",
+    "cht.com.tw",
+    "www.swedishhost.se",
+)
+REALITY_SERVER_NAME_ALIASES = {
+    "www.kernel.org": ["cdn.kernel.org", "kernel.org", "www.kernel.org"],
+    "www.cht.com.tw": ["www.cht.com.tw", "cht.com.tw"],
+    "cht.com.tw": ["www.cht.com.tw", "cht.com.tw"],
+}
+REALITY_DOMAIN_BLOCKLIST = (
+    "cloudflare.com", "apple.com", "microsoft.com",
+)
+REALITY_SUSPICIOUS_LABELS = (
+    "proxy", "vpn", "vless", "xray", "hysteria", "hy2", "trojan",
+)
 
 
 class InstallError(RuntimeError):
@@ -604,8 +627,9 @@ def hy2_config(*, domain: str, port: int, cert: str, key: str, auth: str,
     }
 
 
-def reality_config(*, port: int, target: str, target_port: int, client_id: str,
-                   private_key: str, short_id: str, spec: dict) -> dict:
+def reality_config(*, port: int, target: str, target_port: int, server_names: list[str],
+                   client_id: str, private_key: str, public_key: str, short_id: str,
+                   spider_x: str, spec: dict) -> dict:
     return {
         "log": {"loglevel": "warning"},
         "api": {"tag": "api", "services": ["StatsService"]},
@@ -632,21 +656,32 @@ def reality_config(*, port: int, target: str, target_port: int, client_id: str,
                         "flow": "xtls-rprx-vision",
                     }],
                     "decryption": "none",
+                    "encryption": "none",
                 },
                 "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"]},
                 "streamSettings": {
-                    "method": "raw",
+                    "network": "tcp",
+                    "tcpSettings": {
+                        "acceptProxyProtocol": False,
+                        "header": {"type": "none"},
+                    },
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
                         "target": f"{target}:{target_port}",
                         "xver": 0,
-                        "serverNames": [target],
+                        "serverNames": server_names,
                         "privateKey": private_key,
                         "minClientVer": "1.0.0",
                         "maxClientVer": "",
                         "maxTimeDiff": 0,
                         "shortIds": [short_id],
+                        "settings": {
+                            "publicKey": public_key,
+                            "fingerprint": "chrome",
+                            "serverName": "",
+                            "spiderX": spider_x,
+                        },
                     },
                 },
             },
@@ -688,26 +723,258 @@ def generate_reality_key_pair() -> tuple[str, str]:
     return private_match.group(1), public_match.group(1)
 
 
-def collect_reality_target() -> tuple[str, int]:
-    print("\n[Reality] 伪装目标")
-    print("  请填写本机网络可稳定访问、支持 TLS 1.3 的站点；不要填写 CDN 共用入口。")
-    target = normalize_node_identity(prompt("Reality 目标域名"))
-    if is_ip_identity(target):
-        raise InstallError("Reality 目标请填写域名，不要填写 IP")
-    target_port = prompt_port("Reality 目标端口", 443)
+def reality_scan_ipv4(identity: str) -> str | None:
+    try:
+        address = ipaddress.ip_address(identity)
+        return str(address) if address.version == 4 and address.is_global else None
+    except ValueError:
+        pass
+    try:
+        addresses = socket.getaddrinfo(identity, 443, socket.AF_INET, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return None
+    for item in addresses:
+        address = ipaddress.ip_address(item[4][0])
+        if address.is_global:
+            return str(address)
+    return None
+
+
+def reality_scan_network(address: str) -> ipaddress.IPv4Network:
+    return ipaddress.ip_network(f"{address}/27", strict=False)
+
+
+def reality_domain_allowed(domain: str) -> bool:
+    domain = domain.lower().rstrip(".")
+    if "*" in domain:
+        return False
+    try:
+        normalize_node_identity(domain)
+    except InstallError:
+        return False
+    if any(domain == suffix or domain.endswith(f".{suffix}") for suffix in REALITY_DOMAIN_BLOCKLIST):
+        return False
+    labels = set(domain.split("."))
+    return not labels.intersection(REALITY_SUSPICIOUS_LABELS)
+
+
+def certificate_dns_names(certificate_pem: bytes) -> list[str]:
+    result = subprocess.run(
+        [shutil.which("openssl") or "/usr/bin/openssl", "x509", "-noout", "-ext", "subjectAltName"],
+        input=certificate_pem,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    output = result.stdout.decode("utf-8", "replace")
+    domains = []
+    for value in re.findall(r"DNS:([^,\s]+)", output):
+        domain = value.lower().rstrip(".")
+        if reality_domain_allowed(domain) and domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def ensure_reality_probe_support() -> None:
+    openssl = shutil.which("openssl") or "/usr/bin/openssl"
+    result = subprocess.run(
+        [openssl, "s_client", "-help"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    output = result.stdout.decode("utf-8", "replace")
+    required = ("-tls1_3", "-alpn", "-verify_hostname")
+    if not all(option in output for option in required):
+        raise InstallError("系统 OpenSSL 不支持 Reality 选优所需的 TLS 1.3/H2/域名校验，请先升级 OpenSSL")
+
+
+def openssl_tls_probe(address: str, *, domain: str | None = None,
+                      verify_hostname: bool = False, timeout: float = 4.0) -> tuple[str, float] | None:
+    openssl = shutil.which("openssl") or "/usr/bin/openssl"
+    argv = [
+        openssl, "s_client", "-connect", f"{address}:443",
+        "-tls1_3", "-alpn", "h2", "-showcerts",
+    ]
+    if domain:
+        argv.extend(["-servername", domain])
+    if verify_hostname:
+        argv.extend(["-verify_hostname", domain, "-verify_return_error"])
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv,
+            input=b"",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout.decode("utf-8", "replace")
+    tls13 = re.search(r"Protocol(?: version)?\s*:\s*TLSv1\.3", output)
+    h2 = re.search(r"ALPN protocol\s*:\s*h2\b", output, re.IGNORECASE)
+    if result.returncode != 0 or not tls13 or not h2:
+        return None
+    if verify_hostname and not (
+            "Verify return code: 0 (ok)" in output or "Verification: OK" in output):
+        return None
+    return output, (time.monotonic() - started) * 1000
+
+
+def scan_reality_ip(address: str, timeout: float = 4.0) -> list[tuple[str, float]]:
+    probe = openssl_tls_probe(address, timeout=timeout)
+    if probe is None:
+        return []
+    output, elapsed_ms = probe
+    certificate = re.search(
+        rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        output.encode("utf-8"),
+        re.DOTALL,
+    )
+    if certificate is None:
+        return []
+    domains = certificate_dns_names(certificate.group(0) + b"\n")
+    return [(domain, elapsed_ms) for domain in domains]
+
+
+def resolve_public_ipv4s(domain: str) -> list[str]:
+    try:
+        addresses = socket.getaddrinfo(domain, 443, socket.AF_INET, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return []
+    result = []
+    for item in addresses:
+        address = str(ipaddress.ip_address(item[4][0]))
+        if ipaddress.ip_address(address).is_global and address not in result:
+            result.append(address)
+    return result
+
+
+def measure_reality_candidate(domain: str, address: str, *, source: str,
+                              rounds: int = 3, timeout: float = 4.0) -> dict | None:
+    samples = []
+    for _ in range(rounds):
+        probe = openssl_tls_probe(
+            address, domain=domain, verify_hostname=True, timeout=timeout,
+        )
+        if probe is None:
+            return None
+        samples.append(probe[1])
+    median = statistics.median(samples)
+    jitter = max(samples) - min(samples)
+    return {
+        "target": domain,
+        "address": address,
+        "source": source,
+        "median_ms": median,
+        "max_ms": max(samples),
+        "score": median + jitter,
+    }
+
+
+def nearby_reality_candidates(address: str) -> tuple[ipaddress.IPv4Network, list[tuple[str, str]]]:
+    network = reality_scan_network(address)
+    findings = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(scan_reality_ip, str(candidate)): str(candidate)
+            for candidate in network.hosts()
+        }
+        for future in concurrent.futures.as_completed(futures):
+            candidate_ip = futures[future]
+            try:
+                domains = future.result()
+            except Exception:
+                continue
+            for domain, elapsed_ms in domains:
+                if candidate_ip in resolve_public_ipv4s(domain):
+                    findings.append((domain, candidate_ip, elapsed_ms))
+    findings.sort(key=lambda item: item[2])
+    deduplicated = []
+    for domain, candidate_ip, _ in findings:
+        if all(existing[0] != domain for existing in deduplicated):
+            deduplicated.append((domain, candidate_ip))
+    return network, deduplicated[:5]
+
+
+def select_reality_target(identity: str, *, scan_nearby: bool) -> tuple[dict, ipaddress.IPv4Network | None]:
+    ensure_reality_probe_support()
+    scan_address = reality_scan_ipv4(identity)
+    network = None
+    candidates = []
+    if scan_nearby and scan_address:
+        network, nearby = nearby_reality_candidates(scan_address)
+        candidates.extend((domain, address, "附近 /27") for domain, address in nearby)
+    existing_domains = {candidate[0] for candidate in candidates}
+    for domain in REALITY_FALLBACK_TARGETS:
+        if domain in existing_domains:
+            continue
+        candidates.extend(
+            (domain, address, "成熟域名回退")
+            for address in resolve_public_ipv4s(domain)[:2]
+        )
+
+    measured = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for domain, address, source in candidates:
+            futures.append(executor.submit(
+                measure_reality_candidate, domain, address, source=source,
+            ))
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+            except Exception:
+                continue
+            if result is not None:
+                measured.append(result)
+    if not measured:
+        raise InstallError("没有找到同时通过证书验证、TLS 1.3、H2 和三轮稳定性检查的 Reality 目标")
+    measured.sort(key=lambda item: item["score"])
+    return measured[0], network
+
+
+def collect_reality_target(identity: str) -> dict:
+    print("\n[Reality] 自动选择伪装目标")
+    print("  默认：XTLS Vision、Chrome 指纹、最低客户端版本 1.0.0")
+    scan_address = reality_scan_ipv4(identity)
+    allow_scan = False
+    if scan_address:
+        network = reality_scan_network(scan_address)
+        print(f"  可扫描节点入口附近：{network}（32 个地址，TCP 443）")
+        print("  提醒：官方不建议在云服务器大范围扫描；这里只扫描最小 /27，仍可能触发服务商风控。")
+        allow_scan = yes_no("是否允许本机执行这次受限扫描", True)
+    else:
+        print("  无法确定公网 IPv4，将只测试内置成熟域名。")
+    selected, network = select_reality_target(identity, scan_nearby=allow_scan)
     result = run(
-        [str(XRAY_BINARY), "tls", "ping", f"{target}:{target_port}"],
+        [str(XRAY_BINARY), "tls", "ping", f"{selected['target']}:443"],
         check=False, capture=True,
     )
     if (result.returncode != 0 or "Handshake succeeded" not in result.stdout
             or "TLS 1.3" not in result.stdout):
-        detail = "\n".join(result.stdout.splitlines()[-8:])
-        raise InstallError(
-            f"Reality 目标必须通过 TLS 握手并支持 TLS 1.3：{target}:{target_port}"
-            + (f"\n{detail}" if detail else "")
-        )
-    print("Reality 目标 TLS 检查：通过")
-    return target, target_port
+        raise InstallError(f"Xray 对 Reality 目标的最终 TLS 检查失败：{selected['target']}:443")
+    print(
+        f"  已选择：{selected['target']}:443"
+        f"（{selected['source']}，三轮 TLS 中位 {selected['median_ms']:.0f} ms，"
+        f"最慢 {selected['max_ms']:.0f} ms）"
+    )
+    print("  已验证：证书与域名匹配、TLS 1.3、H2；客户端所在网络可达性仍需实际连接确认。")
+    return {
+        "target": selected["target"],
+        "target_port": 443,
+        "server_names": REALITY_SERVER_NAME_ALIASES.get(
+            selected["target"], [selected["target"]],
+        ),
+        "source": selected["source"],
+        "scan_network": str(network) if network else None,
+        "median_ms": round(selected["median_ms"], 1),
+        "max_ms": round(selected["max_ms"], 1),
+    }
 
 
 def openrc_service(name: str, config: Path) -> str:
@@ -1319,7 +1586,7 @@ def create_node() -> None:
         print(f"  公网监听：{port_protocol} {internal}")
     reality_target = None
     if spec["protocol"] == "reality":
-        reality_target = collect_reality_target()
+        reality_target = collect_reality_target(state["domain"])
     if not yes_no(f"确认设置 {label}", True):
         print("已取消，未修改节点")
         return
@@ -1348,13 +1615,18 @@ def create_node() -> None:
                 credentials["reality_public_key"] = public_key
             credentials.setdefault("reality_client_id", str(uuid.uuid4()))
             credentials.setdefault("reality_short_id", secrets.token_hex(8))
-            target, target_port = reality_target
-            state["reality"] = {"target": target, "target_port": target_port}
+            credentials.setdefault("reality_spider_x", f"/{secrets.token_hex(8)}")
+            target = reality_target["target"]
+            target_port = reality_target["target_port"]
+            state["reality"] = reality_target
             config = reality_config(
                 port=internal, target=target, target_port=target_port,
+                server_names=reality_target["server_names"],
                 client_id=credentials["reality_client_id"],
                 private_key=credentials["reality_private_key"],
-                short_id=credentials["reality_short_id"], spec=spec,
+                public_key=credentials["reality_public_key"],
+                short_id=credentials["reality_short_id"],
+                spider_x=credentials["reality_spider_x"], spec=spec,
             )
         json_write(spec["config"], config)
         validate_xray([spec["config"]])
@@ -1518,7 +1790,8 @@ def reality_uri() -> str:
         "pbk": credentials["reality_public_key"],
         "sid": credentials["reality_short_id"],
         "type": "tcp",
-        "spx": "/",
+        "headerType": "none",
+        "spx": credentials.get("reality_spider_x", "/"),
     })
     return (
         f"vless://{credentials['reality_client_id']}@{uri_host(state['domain'])}:"

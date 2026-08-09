@@ -543,18 +543,27 @@ class ConfigTests(unittest.TestCase):
             port=10443,
             target="target.example.com",
             target_port=443,
+            server_names=["target.example.com", "example.com"],
             client_id="11111111-1111-4111-8111-111111111111",
             private_key="private-key",
+            public_key="public-key",
             short_id="0123456789abcdef",
+            spider_x="/0123456789abcdef",
             spec=spec,
         )
         inbound = config["inbounds"][0]
         self.assertEqual(inbound["protocol"], "vless")
         self.assertEqual(inbound["settings"]["clients"][0]["flow"], "xtls-rprx-vision")
-        self.assertEqual(inbound["streamSettings"]["method"], "raw")
+        self.assertEqual(inbound["settings"]["encryption"], "none")
+        self.assertEqual(inbound["streamSettings"]["network"], "tcp")
+        self.assertEqual(inbound["streamSettings"]["tcpSettings"]["header"], {"type": "none"})
         reality = inbound["streamSettings"]["realitySettings"]
         self.assertEqual(reality["target"], "target.example.com:443")
+        self.assertEqual(reality["serverNames"], ["target.example.com", "example.com"])
         self.assertEqual(reality["minClientVer"], "1.0.0")
+        self.assertEqual(reality["settings"]["publicKey"], "public-key")
+        self.assertEqual(reality["settings"]["fingerprint"], "chrome")
+        self.assertEqual(reality["settings"]["spiderX"], "/0123456789abcdef")
 
     def test_reality_key_parser_supports_current_xray_output(self):
         completed = subprocess.CompletedProcess(
@@ -566,23 +575,99 @@ class ConfigTests(unittest.TestCase):
                 ("private-value", "public-value"),
             )
 
-    def test_reality_target_requires_successful_tls_13_handshake(self):
+    def test_reality_scan_uses_the_containing_27(self):
+        self.assertEqual(str(nm.reality_scan_network("207.57.140.38")), "207.57.140.32/27")
+
+    def test_reality_domain_filter_rejects_template_and_proxy_targets(self):
+        self.assertTrue(nm.reality_domain_allowed("mirror.example.org"))
+        self.assertFalse(nm.reality_domain_allowed("*.example.org"))
+        self.assertFalse(nm.reality_domain_allowed("www.cloudflare.com"))
+        self.assertFalse(nm.reality_domain_allowed("vless.example.org"))
+
+    def test_reality_probe_requires_modern_openssl(self):
+        old_help = subprocess.CompletedProcess(
+            [], 0, stdout=b"-tls1_3 -alpn\n",
+        )
+        with mock.patch.object(nm.subprocess, "run", return_value=old_help):
+            with self.assertRaisesRegex(nm.InstallError, "升级 OpenSSL"):
+                nm.ensure_reality_probe_support()
+
+    def test_reality_probe_accepts_verified_tls13_h2(self):
+        output = (
+            "Protocol: TLSv1.3\n"
+            "ALPN protocol: h2\n"
+            "Verify return code: 0 (ok)\n"
+        ).encode()
+        completed = subprocess.CompletedProcess([], 0, stdout=output)
+        with mock.patch.object(nm.subprocess, "run", return_value=completed):
+            result = nm.openssl_tls_probe(
+                "192.0.2.1", domain="target.example.com", verify_hostname=True,
+            )
+        self.assertIsNotNone(result)
+
+    def test_reality_target_selection_ranks_three_round_checks(self):
+        network = nm.ipaddress.ip_network("207.57.140.32/27")
+
+        def measured(domain, address, *, source, rounds=3, timeout=4.0):
+            score = {"near.example.com": 30.0, "www.kernel.org": 60.0}.get(domain)
+            if score is None:
+                return None
+            return {
+                "target": domain,
+                "address": address,
+                "source": source,
+                "median_ms": score,
+                "max_ms": score + 5,
+                "score": score + 5,
+            }
+
+        with mock.patch.object(
+                nm, "ensure_reality_probe_support"), \
+                mock.patch.object(
+                nm, "reality_scan_ipv4", return_value="207.57.140.38"), \
+                mock.patch.object(
+                    nm, "nearby_reality_candidates",
+                    return_value=(network, [("near.example.com", "207.57.140.40")]),
+                ), \
+                mock.patch.object(nm, "resolve_public_ipv4s", return_value=["192.0.2.1"]), \
+                mock.patch.object(nm, "measure_reality_candidate", side_effect=measured):
+            selected, selected_network = nm.select_reality_target(
+                "node.example.com", scan_nearby=True,
+            )
+        self.assertEqual(selected["target"], "near.example.com")
+        self.assertEqual(selected["source"], "附近 /27")
+        self.assertEqual(selected_network, network)
+
+    def test_reality_target_requires_successful_xray_tls_13_check(self):
         success = subprocess.CompletedProcess(
             [], 0, stdout="Handshake succeeded\nTLS Version: TLS 1.3\n",
         )
-        answers = iter(["target.example.com", ""])
-        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+        selected = {
+            "target": "www.kernel.org",
+            "address": "192.0.2.1",
+            "source": "成熟域名回退",
+            "median_ms": 20.0,
+            "max_ms": 25.0,
+            "score": 25.0,
+        }
+        with mock.patch.object(nm, "reality_scan_ipv4", return_value=None), \
+                mock.patch.object(nm, "select_reality_target", return_value=(selected, None)), \
                 mock.patch.object(nm, "run", return_value=success):
-            self.assertEqual(nm.collect_reality_target(), ("target.example.com", 443))
+            target = nm.collect_reality_target("node.example.com")
+        self.assertEqual(target["target"], "www.kernel.org")
+        self.assertEqual(
+            target["server_names"],
+            ["cdn.kernel.org", "kernel.org", "www.kernel.org"],
+        )
 
         tls12 = subprocess.CompletedProcess(
             [], 0, stdout="Handshake succeeded\nTLS Version: TLS 1.2\n",
         )
-        answers = iter(["target.example.com", ""])
-        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+        with mock.patch.object(nm, "reality_scan_ipv4", return_value=None), \
+                mock.patch.object(nm, "select_reality_target", return_value=(selected, None)), \
                 mock.patch.object(nm, "run", return_value=tls12):
-            with self.assertRaisesRegex(nm.InstallError, "TLS 1.3"):
-                nm.collect_reality_target()
+            with self.assertRaisesRegex(nm.InstallError, "最终 TLS 检查失败"):
+                nm.collect_reality_target("node.example.com")
 
     def test_reality_link_uses_public_nat_port(self):
         state = {
@@ -594,6 +679,7 @@ class ConfigTests(unittest.TestCase):
             "reality_client_id": "11111111-1111-4111-8111-111111111111",
             "reality_public_key": "public-key",
             "reality_short_id": "0123456789abcdef",
+            "reality_spider_x": "/abcdef0123456789",
         }
         with mock.patch.object(nm, "load_state", return_value=state), \
                 mock.patch.object(nm, "load_secrets", return_value=credentials):
@@ -602,6 +688,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("security=reality", link)
         self.assertIn("sni=target.example.com", link)
         self.assertIn("pbk=public-key", link)
+        self.assertIn("spx=%2Fabcdef0123456789", link)
 
     def test_each_inbound_has_explicit_direct_route(self):
         for spec in nm.SERVICE_SPECS.values():
