@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -1750,6 +1750,7 @@ def create_node() -> None:
         if agent_is_configured(state):
             refresh_agent(system, state, credentials)
         print(f"{label} 节点创建完成。")
+        show_host_setup(state)
         print("请选择 3. 查看节点连接，按需显示敏感链接。")
     except Exception:
         print(f"节点创建失败，正在恢复：{backup}", file=sys.stderr)
@@ -1848,16 +1849,16 @@ def show_agent_setup(state: dict | None = None, *, include_token: bool = False) 
     state = state or load_state()
     if not agent_is_configured(state):
         raise InstallError("尚未设置 Agent；请选择 5. 设置 Agent")
-    print("\n3x-ui 节点主机设置（总面板 -> 节点 -> 添加主机）：")
-    print("  说明：这里填写的是节点主机；Agent 是该主机使用的后台连接接口。")
+    print("\n3x-ui 添加节点设置（总面板 -> 节点 -> 添加节点）：")
+    print("  说明：这里配置节点的 Agent 管理连接，不是 VLESS/HY2/Reality 的主机。")
     print("  协议：https")
-    print(f"  节点主机地址（不含 https://）：{state['domain']}")
+    print(f"  地址（不含 https://）：{state['domain']}")
     external = state["ports"]["agent_external_tcp"]
     internal = state["ports"]["agent_internal_tcp"]
-    print(f"  节点主机端口：{external}")
+    print(f"  端口（Agent 外部公网 TCP 端口）：{external}")
     if (state.get("network") or {}).get("mode", "mapped") == "mapped":
         print(f"  NAT 面板映射：外部 TCP {external} -> 内部 TCP {internal}")
-        print("  提醒：3x-ui 的节点主机端口填外部公网端口，不要填 Agent 内部监听端口。")
+        print("  提醒：添加节点表单填 Agent 外部公网端口，不要填内部监听端口。")
     print("  基础路径：/")
     print("  TLS 校验：标准验证（verify；不要选择固定指纹或跳过验证）")
     if include_token:
@@ -1865,6 +1866,29 @@ def show_agent_setup(state: dict | None = None, *, include_token: bool = False) 
         print(f"  Token：{credentials['agent_token']}")
     else:
         print("  Token：安装完成后在菜单选择“显示 Agent 接入信息”查看")
+
+
+def show_host_setup(state: dict | None = None) -> None:
+    state = state or load_state()
+    roles = configured_roles(state)
+    if not roles:
+        return
+    mapped = (state.get("network") or {}).get("mode", "mapped") == "mapped"
+    print("\n3x-ui 主机设置（选择入站后 -> 添加/编辑主机）：")
+    print("  说明：这里才填写 VLESS/HY2/Reality 对外连接的地址和服务端口。")
+    for role in roles:
+        spec = SERVICE_SPECS[role]
+        internal_key, external_key = role_port_keys(role)
+        internal = state["ports"][internal_key]
+        external = state["ports"][external_key]
+        print(f"  {spec['label']}：")
+        print(f"    地址：{state['domain']}:{external}")
+        print(f"    端口：{external}")
+        if mapped:
+            print(
+                f"    NAT 映射：外部 {spec['port_protocol']} {external}"
+                f" -> 内部 {spec['port_protocol']} {internal}"
+            )
 
 
 def hy2_uri(role: str) -> str:
@@ -1936,6 +1960,7 @@ def print_links() -> None:
         print("HY2 中转落地（供中转接入）：", hy2_uri("relay"))
     if "reality" in roles:
         print("VLESS + Reality：", reality_uri())
+    show_host_setup(state)
 
 
 def print_agent_setup() -> None:

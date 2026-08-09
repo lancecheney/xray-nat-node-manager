@@ -403,15 +403,38 @@ class ConfigTests(unittest.TestCase):
             nm.show_agent_setup(state)
         rendered = output.getvalue()
         self.assertIn("node.example.com", rendered)
-        self.assertIn("3x-ui 节点主机设置", rendered)
-        self.assertIn("总面板 -> 节点 -> 添加主机", rendered)
-        self.assertIn("节点主机地址（不含 https://）：node.example.com", rendered)
-        self.assertIn("节点主机端口：45066", rendered)
+        self.assertIn("3x-ui 添加节点设置", rendered)
+        self.assertIn("总面板 -> 节点 -> 添加节点", rendered)
+        self.assertIn("Agent 管理连接", rendered)
+        self.assertIn("地址（不含 https://）：node.example.com", rendered)
+        self.assertIn("端口（Agent 外部公网 TCP 端口）：45066", rendered)
         self.assertIn("外部 TCP 45066 -> 内部 TCP 5201", rendered)
-        self.assertIn("节点主机端口填外部公网端口", rendered)
+        self.assertIn("不要填内部监听端口", rendered)
         self.assertIn("协议：https", rendered)
         self.assertIn("标准验证（verify", rendered)
         self.assertIn("基础路径：/", rendered)
+
+    def test_host_setup_uses_each_proxy_service_external_port(self):
+        output = io.StringIO()
+        state = {
+            "domain": "node.example.com",
+            "network": {"mode": "mapped"},
+            "ports": {
+                "direct_internal_udp": 83,
+                "direct_external_udp": 53320,
+                "reality_internal_tcp": 10443,
+                "reality_external_tcp": 45066,
+            },
+        }
+        with redirect_stdout(output):
+            nm.show_host_setup(state)
+        rendered = output.getvalue()
+        self.assertIn("选择入站后 -> 添加/编辑主机", rendered)
+        self.assertIn("地址：node.example.com:53320", rendered)
+        self.assertIn("端口：53320", rendered)
+        self.assertIn("外部 UDP 53320 -> 内部 UDP 83", rendered)
+        self.assertIn("地址：node.example.com:45066", rendered)
+        self.assertIn("外部 TCP 45066 -> 内部 TCP 10443", rendered)
 
     def test_agent_services_include_only_configured_nodes(self):
         state = {
