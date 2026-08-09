@@ -12,7 +12,7 @@ import node_manager as nm
 class ConfigTests(unittest.TestCase):
     def test_install_questions_are_grouped_and_tls_precedes_ports(self):
         answers = iter([
-            "node.example.com", "3", "/cert.pem", "/key.pem",
+            "node.example.com", "1", "3", "/cert.pem", "/key.pem",
             "5201", "45066", "24443", "58350", "5201", "45066",
         ])
         output = io.StringIO()
@@ -23,10 +23,53 @@ class ConfigTests(unittest.TestCase):
 
         validate.assert_called_once_with("/cert.pem", "/key.pem", "node.example.com")
         rendered = output.getvalue()
-        headings = ["[1/5] 节点地址", "[2/5] TLS 证书", "[3/5] HY2 直连端口", "[4/5] HY2 中转落地端口", "[5/5] Agent 管理端口"]
+        headings = ["[1/6] 节点地址", "[2/6] 端口方式", "[3/6] TLS 证书", "[4/6] HY2 直连端口", "[5/6] HY2 中转落地端口", "[6/6] Agent 管理端口"]
         positions = [rendered.index(heading) for heading in headings]
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(result["ports"]["relay_external_udp"], 58350)
+        self.assertEqual(result["network"]["mode"], "mapped")
+
+    def test_direct_mode_uses_one_required_port_for_each_service(self):
+        answers = iter([
+            "node.example.com", "2", "3", "/cert.pem", "/key.pem",
+            "12001", "12002", "12003",
+        ])
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+                mock.patch.object(nm, "detect_public_ip", return_value=None), \
+                mock.patch.object(nm, "validate_cert_paths"):
+            result = nm.collect_install_answers()
+
+        self.assertEqual(result["network"]["mode"], "direct")
+        self.assertEqual(result["ports"]["direct_internal_udp"], 12001)
+        self.assertEqual(result["ports"]["direct_external_udp"], 12001)
+        self.assertEqual(result["ports"]["agent_internal_tcp"], 12003)
+        self.assertEqual(result["ports"]["agent_external_tcp"], 12003)
+
+    def test_http_validation_has_fixed_public_port_and_configurable_nat_port(self):
+        answers = iter(["2", "18080", "y", "admin@example.com"])
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
+            tls = nm.collect_tls_answers("node.example.com", {"mode": "mapped"})
+        self.assertEqual(tls["external_tcp"], 80)
+        self.assertEqual(tls["internal_tcp"], 18080)
+
+        answers = iter(["2", "admin@example.com"])
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
+            tls = nm.collect_tls_answers("node.example.com", {"mode": "direct"})
+        self.assertEqual(tls["external_tcp"], 80)
+        self.assertEqual(tls["internal_tcp"], 80)
+
+    def test_agent_setup_uses_public_port_and_https(self):
+        output = io.StringIO()
+        state = {
+            "domain": "node.example.com",
+            "ports": {"agent_external_tcp": 45066},
+        }
+        with redirect_stdout(output):
+            nm.show_agent_setup(state)
+        rendered = output.getvalue()
+        self.assertIn("node.example.com", rendered)
+        self.assertIn("45066", rendered)
+        self.assertIn("HTTPS/SSL：开启", rendered)
 
     def test_acme_modes_match_identity_type(self):
         cloudflare = nm.acme_validation_args("node.example.com", {"method": "cloudflare"})

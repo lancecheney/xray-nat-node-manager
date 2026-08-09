@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -119,8 +119,8 @@ def prompt(text: str, default: str | None = None, *, secret: bool = False) -> st
     return value
 
 
-def prompt_port(text: str, default: int) -> int:
-    value = int(prompt(text, str(default)))
+def prompt_port(text: str) -> int:
+    value = int(prompt(text))
     if not 1 <= value <= 65535:
         raise InstallError(f"端口超出范围：{value}")
     return value
@@ -178,8 +178,27 @@ def certificate_method_label(method: str) -> str:
     }[method]
 
 
-def collect_tls_answers(identity: str) -> dict:
-    print("\n[2/5] TLS 证书")
+def collect_network_answers() -> dict:
+    print("\n[2/6] 端口方式")
+    print(" 1. 端口映射（NAT：分别设置内部端口和外部端口）")
+    print(" 2. 无端口映射（公网机：监听端口就是公网端口）")
+    choice = prompt("请选择", "1")
+    if choice not in {"1", "2"}:
+        raise InstallError("无效的端口方式")
+    return {"mode": "mapped" if choice == "1" else "direct"}
+
+
+def collect_service_ports(label: str, protocol: str, network: dict) -> tuple[int, int]:
+    if network["mode"] == "mapped":
+        internal = prompt_port(f"{label}内部 {protocol} 端口")
+        external = prompt_port(f"{label}外部公网 {protocol} 端口")
+        return internal, external
+    port = prompt_port(f"{label}{protocol} 端口")
+    return port, port
+
+
+def collect_tls_answers(identity: str, network: dict) -> dict:
+    print("\n[3/6] TLS 证书")
     if is_ip_identity(identity):
         print(" 1. HTTP-01 自动申请（公网 TCP 80）")
         print(" 2. TLS-ALPN-01 自动申请（公网 TCP 443）")
@@ -207,9 +226,13 @@ def collect_tls_answers(identity: str) -> dict:
         result["_cf_token"] = prompt("Cloudflare API Token", secret=True)
     else:
         external = 80 if method == "http" else 443
-        internal = prompt_port("ACME 内部 TCP 监听端口", external)
-        if not yes_no(f"确认 NAT 已映射公网 TCP {external} -> 内部 TCP {internal}", False):
-            raise InstallError("自动申请证书前必须完成 ACME TCP 端口映射")
+        if network["mode"] == "mapped":
+            internal = prompt_port("ACME 内部 TCP 监听端口")
+            if not yes_no(f"确认 NAT 已映射公网 TCP {external} -> 内部 TCP {internal}", False):
+                raise InstallError("自动申请证书前必须完成 ACME TCP 端口映射")
+        else:
+            internal = external
+            print(f"  此验证方式固定使用公网 TCP {external}，本机也将监听 TCP {internal}")
         result.update({"external_tcp": external, "internal_tcp": internal})
     result["email"] = prompt("Let's Encrypt 账户邮箱（可留空）", "")
     return result
@@ -695,27 +718,25 @@ def check_port_conflicts(ports: list[tuple[int, str]]) -> None:
 
 
 def collect_install_answers() -> dict:
-    print("\n[1/5] 节点地址")
+    print("\n[1/6] 节点地址")
     detected_ip = detect_public_ip()
     if detected_ip:
         print(f"检测到公网出口 IP：{detected_ip}")
     domain = normalize_node_identity(prompt("节点域名或公网入口 IP", detected_ip))
     if is_ip_identity(domain) and not yes_no(
-            "检测值可能只是出口 IP，确认它与 NAT 面板的公网入口 IP 相同", False):
-        raise InstallError("请从 NAT 面板确认公网入口 IP，或填写节点域名")
-    tls = collect_tls_answers(domain)
+            "检测值可能只是出口 IP，确认它也是本机可接收连接的公网入口 IP", False):
+        raise InstallError("请确认公网入口 IP，或填写节点域名")
+    network = collect_network_answers()
+    tls = collect_tls_answers(domain, network)
 
-    print("\n[3/5] HY2 直连端口")
-    direct_internal = prompt_port("HY2 直连内部 UDP 端口", 5201)
-    direct_external = prompt_port("HY2 直连外部 UDP 端口", 45066)
+    print("\n[4/6] HY2 直连端口")
+    direct_internal, direct_external = collect_service_ports("HY2 直连", "UDP", network)
 
-    print("\n[4/5] HY2 中转落地端口")
-    relay_internal = prompt_port("HY2 中转内部 UDP 端口", 24443)
-    relay_external = prompt_port("HY2 中转外部 UDP 端口", 58350)
+    print("\n[5/6] HY2 中转落地端口")
+    relay_internal, relay_external = collect_service_ports("HY2 中转落地", "UDP", network)
 
-    print("\n[5/5] Agent 管理端口")
-    agent_internal = prompt_port("Agent 内部 TCP 端口", 5201)
-    agent_external = prompt_port("Agent 外部 TCP 端口", 45066)
+    print("\n[6/6] Agent 管理端口")
+    agent_internal, agent_external = collect_service_ports("Agent 管理", "TCP", network)
     check_port_conflicts([(direct_internal, "udp"), (relay_internal, "udp"), (agent_internal, "tcp")])
     check_port_conflicts([(direct_external, "udp"), (relay_external, "udp"), (agent_external, "tcp")])
     if tls.get("internal_tcp") == agent_internal:
@@ -724,6 +745,7 @@ def collect_install_answers() -> dict:
         raise InstallError(f"ACME 与 Agent 不能共用外部 TCP 端口：{agent_external}")
     return {
         "domain": domain,
+        "network": network,
         "tls": tls,
         "cert": tls.get("cert"),
         "key": tls.get("key"),
@@ -837,8 +859,9 @@ def install_all() -> None:
         answers["system"] = system
         answers["agent_sha256"] = sha256(packaged_agent)
         json_write(STATE, state_without_secrets(answers))
-        print("安装完成。请在 NAT 面板添加以下映射：")
+        print("安装完成。端口配置：")
         show_mapping(answers)
+        show_agent_setup(answers)
         print(f"敏感凭据只保存在：{SECRETS}")
     except Exception:
         print(f"安装失败，正在恢复：{backup}", file=sys.stderr)
@@ -860,12 +883,35 @@ def xray_asset_for_agent() -> str:
 def show_mapping(state: dict | None = None) -> None:
     state = state or json.loads(STATE.read_text(encoding="utf-8"))
     ports = state["ports"]
-    print(f"  UDP {ports['direct_external_udp']} -> UDP {ports['direct_internal_udp']}  (HY2 直连)")
-    print(f"  UDP {ports['relay_external_udp']} -> UDP {ports['relay_internal_udp']}  (HY2 美国中转落地)")
-    print(f"  TCP {ports['agent_external_tcp']} -> TCP {ports['agent_internal_tcp']}  (xui-agent)")
+    mapped = (state.get("network") or {}).get("mode", "mapped") == "mapped"
+    if mapped:
+        print("  请在 NAT 面板保留以下映射：")
+        print(f"  UDP {ports['direct_external_udp']} -> UDP {ports['direct_internal_udp']}  (HY2 直连)")
+        print(f"  UDP {ports['relay_external_udp']} -> UDP {ports['relay_internal_udp']}  (HY2 美国中转落地)")
+        print(f"  TCP {ports['agent_external_tcp']} -> TCP {ports['agent_internal_tcp']}  (xui-agent)")
+    else:
+        print(f"  UDP {ports['direct_internal_udp']}  (HY2 直连，内外相同)")
+        print(f"  UDP {ports['relay_internal_udp']}  (HY2 美国中转落地，内外相同)")
+        print(f"  TCP {ports['agent_internal_tcp']}  (xui-agent，内外相同)")
     tls = state.get("tls") or {}
     if tls.get("external_tcp"):
-        print(f"  TCP {tls['external_tcp']} -> TCP {tls['internal_tcp']}  (ACME 自动续期，必须保留)")
+        if mapped:
+            print(f"  TCP {tls['external_tcp']} -> TCP {tls['internal_tcp']}  (ACME 自动续期，必须保留)")
+        else:
+            print(f"  TCP {tls['internal_tcp']}  (ACME 自动续期验证，公网端口固定)")
+
+
+def show_agent_setup(state: dict | None = None, *, include_token: bool = False) -> None:
+    state = state or json.loads(STATE.read_text(encoding="utf-8"))
+    print("\n3x-ui Agent 设置：")
+    print(f"  主机（不含 https://）：{state['domain']}")
+    print(f"  端口：{state['ports']['agent_external_tcp']}")
+    print("  HTTPS/SSL：开启")
+    if include_token:
+        credentials = json.loads(SECRETS.read_text(encoding="utf-8"))
+        print(f"  Token：{credentials['agent_token']}")
+    else:
+        print("  Token：安装完成后在菜单选择“显示 Agent 接入信息”查看")
 
 
 def hy2_uri(role: str) -> str:
@@ -897,12 +943,19 @@ def print_links() -> None:
     print("中转落地（提供给美国出站）：", hy2_uri("relay"))
 
 
+def print_agent_setup() -> None:
+    if not STATE.exists() or not SECRETS.exists():
+        raise InstallError("尚未完成安装")
+    show_agent_setup(include_token=True)
+
+
 def menu() -> None:
     actions = {
         "1": ("全新安装/重装", install_all),
         "2": ("查看服务状态", status),
-        "3": ("查看 NAT 映射", show_mapping),
+        "3": ("查看端口配置/映射", show_mapping),
         "4": ("显示节点链接（包含敏感凭据）", print_links),
+        "5": ("显示 Agent 接入信息（包含敏感凭据）", print_agent_setup),
     }
     while True:
         print(f"\nXray NAT 节点管理器 v{VERSION}")

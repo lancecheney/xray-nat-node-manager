@@ -24,16 +24,17 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh)
 ```
 
-脚本会下载完整安装包、安装必要依赖并自动进入 `node-manager` 交互菜单。选择 `1. 全新安装/重装` 后，程序会按“节点地址、TLS、HY2 直连、HY2 中转、Agent”五个区块引导输入，最后汇总确认后才修改系统。
+脚本会下载完整安装包、安装必要依赖并自动进入 `node-manager` 交互菜单。选择 `1. 全新安装/重装` 后，程序会先选择“端口映射”或“无端口映射”，再按区块引导输入。HY2 与 Agent 的业务端口都必须手动填写；NAT 映射模式分别填写内部监听端口和外部公网端口，无映射模式只填写一个端口。
 
 ## TLS 与自动续期
 
 - 域名默认推荐 Cloudflare DNS-01，不需要公网 80/443；API Token 使用隐藏输入。
-- HTTP-01 必须长期保留公网 TCP 80 到所填内部端口的映射。
-- IP 证书还可使用 TLS-ALPN-01，但必须长期保留公网 TCP 443 映射。
+- HTTP-01 的公网验证端口固定为 TCP 80；NAT 模式可将它映射到手动填写的内部 TCP 端口。
+- IP 证书还可使用 TLS-ALPN-01，其公网验证端口固定为 TCP 443；NAT 模式可映射到其他内部 TCP 端口。
 - 自动申请使用固定并校验 SHA-256 的 `acme.sh 3.1.4`，先通过 Let’s Encrypt 测试环境，再申请正式证书。
 - 两套 HY2 与 `xui-agent` 共用同一份证书；续期后同时重启三个服务。
 - Cloudflare Token 由 `acme.sh` 保存在节点本地的 `0600` 配置中，不写入节点状态、链接或安装日志。
+- 安装完成会输出 3x-ui Agent 所需的主机、外部端口和 HTTPS 设置；Token 需通过菜单中的敏感信息选项主动显示。
 
 也可以克隆或上传整个仓库后执行：
 
