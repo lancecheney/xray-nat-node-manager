@@ -424,6 +424,8 @@ class ConfigTests(unittest.TestCase):
                 "direct_external_udp": 53320,
                 "reality_internal_tcp": 10443,
                 "reality_external_tcp": 45066,
+                "agent_internal_tcp": 5201,
+                "agent_external_tcp": 2053,
             },
         }
         with redirect_stdout(output):
@@ -435,6 +437,28 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("外部 UDP 53320 -> 内部 UDP 83", rendered)
         self.assertIn("地址：node.example.com:45066", rendered)
         self.assertIn("外部 TCP 45066 -> 内部 TCP 10443", rendered)
+
+    def test_host_setup_is_silent_without_agent_or_mapping(self):
+        mapped_without_agent = {
+            "domain": "node.example.com",
+            "network": {"mode": "mapped"},
+            "ports": {"direct_internal_udp": 83, "direct_external_udp": 53320},
+        }
+        direct_with_agent = {
+            "domain": "node.example.com",
+            "network": {"mode": "direct"},
+            "ports": {
+                "direct_internal_udp": 83,
+                "direct_external_udp": 53320,
+                "agent_internal_tcp": 5201,
+                "agent_external_tcp": 2053,
+            },
+        }
+        for state in (mapped_without_agent, direct_with_agent):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                nm.show_host_setup(state)
+            self.assertEqual(output.getvalue(), "")
 
     def test_agent_services_include_only_configured_nodes(self):
         state = {

@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -1750,7 +1750,6 @@ def create_node() -> None:
         if agent_is_configured(state):
             refresh_agent(system, state, credentials)
         print(f"{label} 节点创建完成。")
-        show_host_setup(state)
         print("请选择 3. 查看节点连接，按需显示敏感链接。")
     except Exception:
         print(f"节点创建失败，正在恢复：{backup}", file=sys.stderr)
@@ -1806,6 +1805,7 @@ def configure_agent() -> None:
         json_write(STATE, state)
         print("Agent 设置完成。")
         show_agent_setup(state)
+        show_host_setup(state)
     except Exception:
         print(f"Agent 设置失败，正在恢复：{backup}", file=sys.stderr)
         if not service_preexisted:
@@ -1870,12 +1870,16 @@ def show_agent_setup(state: dict | None = None, *, include_token: bool = False) 
 
 def show_host_setup(state: dict | None = None) -> None:
     state = state or load_state()
+    if (state.get("network") or {}).get("mode", "mapped") != "mapped":
+        return
+    if not agent_is_configured(state):
+        return
     roles = configured_roles(state)
     if not roles:
         return
-    mapped = (state.get("network") or {}).get("mode", "mapped") == "mapped"
-    print("\n3x-ui 主机设置（选择入站后 -> 添加/编辑主机）：")
-    print("  说明：这里才填写 VLESS/HY2/Reality 对外连接的地址和服务端口。")
+    print("\n端口映射模式提醒：请在 3x-ui 总面板的主机设置中填写节点对外连接信息：")
+    print("  说明：这里填写的是 VLESS/HY2/Reality 节点主机，不是 Agent 管理连接。")
+    print("  选择入站后 -> 添加/编辑主机，使用各服务的外部公网地址和端口。")
     for role in roles:
         spec = SERVICE_SPECS[role]
         internal_key, external_key = role_port_keys(role)
@@ -1884,11 +1888,10 @@ def show_host_setup(state: dict | None = None) -> None:
         print(f"  {spec['label']}：")
         print(f"    地址：{state['domain']}:{external}")
         print(f"    端口：{external}")
-        if mapped:
-            print(
-                f"    NAT 映射：外部 {spec['port_protocol']} {external}"
-                f" -> 内部 {spec['port_protocol']} {internal}"
-            )
+        print(
+            f"    NAT 映射：外部 {spec['port_protocol']} {external}"
+            f" -> 内部 {spec['port_protocol']} {internal}"
+        )
 
 
 def hy2_uri(role: str) -> str:
@@ -1960,7 +1963,6 @@ def print_links() -> None:
         print("HY2 中转落地（供中转接入）：", hy2_uri("relay"))
     if "reality" in roles:
         print("VLESS + Reality：", reality_uri())
-    show_host_setup(state)
 
 
 def print_agent_setup() -> None:
