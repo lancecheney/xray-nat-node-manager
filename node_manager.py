@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -77,6 +77,40 @@ def run(argv: list[str], *, check: bool = True, capture: bool = False,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.STDOUT if capture else None,
     )
+
+
+def sanitize_acme_output(output: str) -> str:
+    lines = []
+    in_certificate = False
+    hidden_markers = (
+        "ACCOUNT_THUMBPRINT=", "Adding TXT value:", "Removing txt:",
+        "Le_OrderFinalize=", "Le_LinkCert=",
+    )
+    for line in output.splitlines():
+        if "-----BEGIN CERTIFICATE-----" in line:
+            in_certificate = True
+            continue
+        if "-----END CERTIFICATE-----" in line:
+            in_certificate = False
+            continue
+        if in_certificate or any(marker in line for marker in hidden_markers):
+            continue
+        line = re.sub(r"cfut_[A-Za-z0-9_-]+", "cfut_[redacted]", line)
+        line = re.sub(r"(CF_(?:Token|Key|Email)=)[^ ]+", r"\1[redacted]", line)
+        if line.strip():
+            lines.append(line)
+    return "\n".join(lines[-20:])
+
+
+def run_acme_step(argv: list[str], label: str, *, env: dict[str, str] | None = None,
+                  cwd: str | Path | None = None) -> subprocess.CompletedProcess:
+    print(f"{label}...", flush=True)
+    result = run(argv, check=False, capture=True, env=env, cwd=cwd)
+    if result.returncode != 0:
+        detail = sanitize_acme_output(result.stdout)
+        raise InstallError(f"{label}失败" + (f":\n{detail}" if detail else ""))
+    print(f"{label}：完成")
+    return result
 
 
 def parse_os_release(content: str) -> dict[str, str]:
@@ -735,12 +769,18 @@ def acme_command(config_home: Path = ACME_CONFIG_HOME, cert_home: Path = ACME_CE
 
 def ensure_cron_running(system: dict[str, str]) -> None:
     if system["init"] == "openrc":
-        run([shutil.which("rc-update") or "/sbin/rc-update", "add", "crond", "default"], check=False)
-        run([shutil.which("rc-service") or "/sbin/rc-service", "crond", "start"])
+        rc_update = shutil.which("rc-update") or "/sbin/rc-update"
+        rc_service = shutil.which("rc-service") or "/sbin/rc-service"
+        run([rc_update, "add", "crond", "default"], check=False, capture=True)
+        status = run([rc_service, "crond", "status"], check=False, capture=True)
+        if status.returncode != 0:
+            run([rc_service, "crond", "start"], capture=True)
     else:
         systemctl = shutil.which("systemctl") or "/bin/systemctl"
-        run([systemctl, "enable", "cron"], check=False)
-        run([systemctl, "start", "cron"])
+        run([systemctl, "enable", "cron"], check=False, capture=True)
+        status = run([systemctl, "is-active", "cron"], check=False, capture=True)
+        if status.returncode != 0:
+            run([systemctl, "start", "cron"], capture=True)
 
 
 def install_acme_client(system: dict[str, str], email: str) -> None:
@@ -757,7 +797,7 @@ def install_acme_client(system: dict[str, str], email: str) -> None:
                 "--no-profile"]
         if email:
             argv += ["--email", email]
-        run(argv, cwd=source)
+        run_acme_step(argv, "安装证书工具", cwd=source)
     if not (ACME_HOME / "acme.sh").is_file():
         raise InstallError("acme.sh 安装后入口不存在")
     ACME_CONFIG_HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -822,16 +862,24 @@ def issue_certificate(system: dict[str, str], identity: str, tls: dict) -> tuple
         staging_certs = staging / "certs"
         staging_config.mkdir(mode=0o700)
         staging_certs.mkdir(mode=0o700)
-        run([*acme_command(staging_config, staging_certs), "--server", "letsencrypt_test",
-             *issue_args], env=environment)
-    run([*acme_command(), "--server", "letsencrypt", *issue_args], env=environment)
+        run_acme_step(
+            [*acme_command(staging_config, staging_certs), "--server", "letsencrypt_test", *issue_args],
+            "Let's Encrypt 测试验证", env=environment,
+        )
+    run_acme_step(
+        [*acme_command(), "--server", "letsencrypt", *issue_args],
+        "Let's Encrypt 正式证书申请", env=environment,
+    )
 
     cert, key = managed_certificate_paths(identity)
     cert.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     write_atomic(ACME_RELOAD, certificate_reload_script(system), 0o755)
-    run([*acme_command(), "--install-cert", "-d", identity, "--ecc",
+    run_acme_step(
+        [*acme_command(), "--install-cert", "-d", identity, "--ecc",
          "--fullchain-file", str(cert), "--key-file", str(key),
-         "--reloadcmd", str(ACME_RELOAD)], env=environment)
+         "--reloadcmd", str(ACME_RELOAD)],
+        "安装证书并配置自动续期", env=environment,
+    )
     os.chmod(cert, 0o644)
     os.chmod(key, 0o600)
     for path in ACME_CONFIG_HOME.rglob("*"):

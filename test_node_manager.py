@@ -12,6 +12,35 @@ import node_manager as nm
 
 
 class ConfigTests(unittest.TestCase):
+    def test_successful_acme_output_is_replaced_with_short_progress(self):
+        noisy = (
+            "Adding TXT value: challenge-secret\n"
+            "ACCOUNT_THUMBPRINT='thumbprint'\n"
+            "-----BEGIN CERTIFICATE-----\nMIIBPUBLIC\n-----END CERTIFICATE-----\n"
+            "Cert success.\n"
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout=noisy)
+        output = io.StringIO()
+        with mock.patch.object(nm, "run", return_value=completed), redirect_stdout(output):
+            nm.run_acme_step(["acme.sh"], "申请测试证书")
+        rendered = output.getvalue()
+        self.assertEqual(rendered, "申请测试证书...\n申请测试证书：完成\n")
+        self.assertNotIn("CERTIFICATE", rendered)
+        self.assertNotIn("challenge-secret", rendered)
+
+    def test_failed_acme_output_keeps_error_but_redacts_details(self):
+        noisy = (
+            "Adding TXT value: challenge-secret\n"
+            "CF_Token=cfut_super_secret\n"
+            "Cloudflare API returned permission denied\n"
+        )
+        completed = subprocess.CompletedProcess([], 1, stdout=noisy)
+        with mock.patch.object(nm, "run", return_value=completed):
+            with self.assertRaisesRegex(nm.InstallError, "permission denied") as caught:
+                nm.run_acme_step(["acme.sh"], "申请正式证书")
+        self.assertNotIn("challenge-secret", str(caught.exception))
+        self.assertNotIn("cfut_super_secret", str(caught.exception))
+
     def test_acme_installer_runs_from_extracted_source_directory(self):
         archive = b"fixture archive"
         with tempfile.TemporaryDirectory() as directory:
