@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -1848,15 +1848,16 @@ def show_agent_setup(state: dict | None = None, *, include_token: bool = False) 
     state = state or load_state()
     if not agent_is_configured(state):
         raise InstallError("尚未设置 Agent；请选择 5. 设置 Agent")
-    print("\n3x-ui Agent 设置：")
+    print("\n3x-ui 节点主机设置（总面板 -> 节点 -> 添加主机）：")
+    print("  说明：这里填写的是节点主机；Agent 是该主机使用的后台连接接口。")
     print("  协议：https")
-    print(f"  主机（不含 https://）：{state['domain']}")
+    print(f"  节点主机地址（不含 https://）：{state['domain']}")
     external = state["ports"]["agent_external_tcp"]
     internal = state["ports"]["agent_internal_tcp"]
-    print(f"  3x-ui 主机设置中的端口：{external}")
+    print(f"  节点主机端口：{external}")
     if (state.get("network") or {}).get("mode", "mapped") == "mapped":
         print(f"  NAT 面板映射：外部 TCP {external} -> 内部 TCP {internal}")
-        print("  提醒：3x-ui 填外部公网端口，不要填 Agent 内部监听端口。")
+        print("  提醒：3x-ui 的节点主机端口填外部公网端口，不要填 Agent 内部监听端口。")
     print("  基础路径：/")
     print("  TLS 校验：标准验证（verify；不要选择固定指纹或跳过验证）")
     if include_token:
