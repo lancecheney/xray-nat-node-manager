@@ -259,7 +259,7 @@ class ConfigTests(unittest.TestCase):
         with mock.patch("builtins.input", return_value="0"), redirect_stdout(output):
             nm.menu()
         rendered = output.getvalue()
-        self.assertIn("1. 全新设置", rendered)
+        self.assertIn("1. 基础设置（首次使用）", rendered)
         self.assertIn("2. 设置节点", rendered)
         self.assertIn("3. 查看节点连接", rendered)
         self.assertIn("5. 设置 Agent", rendered)

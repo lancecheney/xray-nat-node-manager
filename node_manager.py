@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -859,7 +859,7 @@ def validate_xray(configs: list[Path]) -> None:
 
 def load_state() -> dict:
     if not STATE.is_file():
-        raise InstallError("尚未完成基础设置；请先选择 1. 全新设置")
+        raise InstallError("尚未完成基础设置；请先选择 1. 基础设置")
     state = json.loads(STATE.read_text(encoding="utf-8"))
     state.setdefault("ports", {})
     return state
@@ -1276,7 +1276,7 @@ def show_status_and_mapping() -> None:
 
 def menu() -> None:
     actions = {
-        "1": ("全新设置（基础环境、域名和证书）", setup_base),
+        "1": ("基础设置（首次使用）", setup_base),
         "2": ("设置节点", configure_node),
         "3": ("查看节点连接（包含敏感凭据）", print_links),
         "4": ("查看服务状态/端口映射", show_status_and_mapping),

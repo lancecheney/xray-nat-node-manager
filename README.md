@@ -28,7 +28,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 脚本会下载完整安装包、安装必要依赖并自动进入模块化菜单：
 
 ```text
-1. 全新设置（基础环境、域名和证书）
+1. 基础设置（首次使用）
 2. 设置节点
 3. 查看节点连接（包含敏感凭据）
 4. 查看服务状态/端口映射
