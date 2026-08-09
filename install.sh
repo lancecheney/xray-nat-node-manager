@@ -33,12 +33,12 @@ fi
 . /etc/os-release
 case "${ID:-}" in
   alpine)
-    apk add --no-cache python3 openssl ca-certificates
+    apk add --no-cache python3 openssl ca-certificates dcron socat
     ;;
   debian|ubuntu)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends python3 openssl ca-certificates
+    apt-get install -y --no-install-recommends python3 openssl ca-certificates cron socat
     apt-get clean
     rm -rf /var/lib/apt/lists/*
     ;;

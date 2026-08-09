@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import getpass
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -16,15 +17,19 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
 
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 XRAY_VERSION = "26.7.28"
+ACME_VERSION = "3.1.4"
+ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
 ROOT = Path("/etc/xray-nat-node-manager")
 STATE = ROOT / "state.json"
 SECRETS = ROOT / "secrets.json"
@@ -33,6 +38,10 @@ AGENT_STATE = Path("/var/lib/xui-agent/state.json")
 AGENT_BINARY = Path("/usr/local/sbin/xui-agent")
 XRAY_BINARY = Path("/usr/local/bin/xray")
 BACKUP_ROOT = Path("/var/backups/xray-nat-node-manager")
+ACME_HOME = Path("/opt/acme.sh")
+ACME_CONFIG_HOME = Path("/etc/acme.sh")
+ACME_CERT_HOME = Path("/var/lib/acme.sh/certs")
+ACME_RELOAD = Path("/usr/local/sbin/xray-nat-node-manager-cert-reload")
 SERVICE_SPECS = {
     "direct": {
         "name": "xray-hy2-direct",
@@ -55,11 +64,13 @@ class InstallError(RuntimeError):
     pass
 
 
-def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+def run(argv: list[str], *, check: bool = True, capture: bool = False,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv,
         check=check,
         text=True,
+        env=env,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.STDOUT if capture else None,
     )
@@ -142,6 +153,66 @@ def is_ip_identity(value: str) -> bool:
 
 def uri_host(value: str) -> str:
     return f"[{value}]" if ":" in value else value
+
+
+def detect_public_ip() -> str | None:
+    for url in ("https://api.ipify.org", "https://api64.ipify.org"):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": f"xray-nat-node-manager/{VERSION}"})
+            with urllib.request.urlopen(request, timeout=8) as response:
+                value = response.read(128).decode("ascii").strip()
+            address = ipaddress.ip_address(value)
+            if address.is_global:
+                return str(address)
+        except (OSError, UnicodeError, ValueError, urllib.error.URLError):
+            continue
+    return None
+
+
+def certificate_method_label(method: str) -> str:
+    return {
+        "cloudflare": "Cloudflare DNS-01 自动申请（无需端口）",
+        "http": "HTTP-01 自动申请（公网 TCP 80）",
+        "alpn": "TLS-ALPN-01 自动申请（公网 TCP 443）",
+        "existing": "使用已有证书",
+    }[method]
+
+
+def collect_tls_answers(identity: str) -> dict:
+    print("\n[2/5] TLS 证书")
+    if is_ip_identity(identity):
+        print(" 1. HTTP-01 自动申请（公网 TCP 80）")
+        print(" 2. TLS-ALPN-01 自动申请（公网 TCP 443）")
+        print(" 3. 使用已有 IP 证书")
+        choice = prompt("请选择", "1")
+        methods = {"1": "http", "2": "alpn", "3": "existing"}
+    else:
+        print(" 1. Cloudflare DNS 自动申请（推荐，无需端口）")
+        print(" 2. HTTP-01 自动申请（需要公网 TCP 80）")
+        print(" 3. 使用已有证书")
+        choice = prompt("请选择", "1")
+        methods = {"1": "cloudflare", "2": "http", "3": "existing"}
+    method = methods.get(choice)
+    if method is None:
+        raise InstallError("无效的证书方式")
+
+    result = {"method": method}
+    if method == "existing":
+        cert = prompt("TLS 完整证书路径", "/etc/ssl/node/fullchain.pem")
+        key = prompt("TLS 私钥路径", "/etc/ssl/node/key.pem")
+        validate_cert_paths(cert, key, identity)
+        result.update({"cert": cert, "key": key})
+        return result
+    if method == "cloudflare":
+        result["_cf_token"] = prompt("Cloudflare API Token", secret=True)
+    else:
+        external = 80 if method == "http" else 443
+        internal = prompt_port("ACME 内部 TCP 监听端口", external)
+        if not yes_no(f"确认 NAT 已映射公网 TCP {external} -> 内部 TCP {internal}", False):
+            raise InstallError("自动申请证书前必须完成 ACME TCP 端口映射")
+        result.update({"external_tcp": external, "internal_tcp": internal})
+    result["email"] = prompt("Let's Encrypt 账户邮箱（可留空）", "")
+    return result
 
 
 def yes_no(text: str, default: bool = False) -> bool:
@@ -408,21 +479,6 @@ def service_daemon_reload(system: dict[str, str]) -> None:
         run([shutil.which("systemctl") or "/bin/systemctl", "daemon-reload"])
 
 
-def make_agent_cert(domain: str) -> tuple[str, str]:
-    ROOT.mkdir(parents=True, exist_ok=True)
-    cert = ROOT / "agent.crt"
-    key = ROOT / "agent.key"
-    san_type = "IP" if is_ip_identity(domain) else "DNS"
-    run([
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "825", "-nodes",
-        "-subj", f"/CN={domain}", "-addext", f"subjectAltName={san_type}:{domain}",
-        "-keyout", str(key), "-out", str(cert),
-    ])
-    os.chmod(key, 0o600)
-    os.chmod(cert, 0o644)
-    return str(cert), str(key)
-
-
 def validate_cert_paths(cert: str, key: str, identity: str) -> None:
     if not Path(cert).is_file() or not Path(key).is_file():
         raise InstallError("TLS 证书或私钥文件不存在")
@@ -446,6 +502,132 @@ def validate_cert_paths(cert: str, key: str, identity: str) -> None:
         raise InstallError("TLS 私钥无法解析")
     if cert_public.stdout.strip() != key_public.stdout.strip():
         raise InstallError("TLS 证书与私钥不匹配")
+
+
+def safe_extract_tar(archive: bytes, destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as package:
+        members = package.getmembers()
+        for member in members:
+            target = (destination / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise InstallError("acme.sh 压缩包包含不安全路径")
+            if member.issym() or member.islnk():
+                raise InstallError("acme.sh 压缩包包含链接，拒绝安装")
+        package.extractall(destination, members=members)
+    directories = [path for path in destination.iterdir() if path.is_dir()]
+    if len(directories) != 1 or not (directories[0] / "acme.sh").is_file():
+        raise InstallError("acme.sh 压缩包结构无效")
+    return directories[0]
+
+
+def acme_command(config_home: Path = ACME_CONFIG_HOME, cert_home: Path = ACME_CERT_HOME) -> list[str]:
+    return [str(ACME_HOME / "acme.sh"), "--home", str(ACME_HOME),
+            "--config-home", str(config_home), "--cert-home", str(cert_home)]
+
+
+def ensure_cron_running(system: dict[str, str]) -> None:
+    if system["init"] == "openrc":
+        run([shutil.which("rc-update") or "/sbin/rc-update", "add", "crond", "default"], check=False)
+        run([shutil.which("rc-service") or "/sbin/rc-service", "crond", "start"])
+    else:
+        systemctl = shutil.which("systemctl") or "/bin/systemctl"
+        run([systemctl, "enable", "cron"], check=False)
+        run([systemctl, "start", "cron"])
+
+
+def install_acme_client(system: dict[str, str], email: str) -> None:
+    url = f"https://github.com/acmesh-official/acme.sh/archive/refs/tags/{ACME_VERSION}.tar.gz"
+    request = urllib.request.Request(url, headers={"User-Agent": f"xray-nat-node-manager/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        archive = response.read()
+    if hashlib.sha256(archive).hexdigest() != ACME_ARCHIVE_SHA256:
+        raise InstallError("acme.sh 下载文件 SHA-256 不匹配")
+    with tempfile.TemporaryDirectory(prefix="acme-install-", dir="/tmp") as directory:
+        source = safe_extract_tar(archive, Path(directory))
+        argv = [str(source / "acme.sh"), "--install", "--home", str(ACME_HOME),
+                "--config-home", str(ACME_CONFIG_HOME), "--cert-home", str(ACME_CERT_HOME),
+                "--no-profile"]
+        if email:
+            argv += ["--email", email]
+        run(argv)
+    if not (ACME_HOME / "acme.sh").is_file():
+        raise InstallError("acme.sh 安装后入口不存在")
+    ACME_CONFIG_HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(ACME_CONFIG_HOME, 0o700)
+    ensure_cron_running(system)
+
+
+def certificate_reload_script(system: dict[str, str]) -> str:
+    names = [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]
+    if system["init"] == "openrc":
+        body = "\n".join(
+            f'[ ! -x /etc/init.d/{name} ] || /sbin/rc-service {name} restart' for name in names
+        )
+    else:
+        body = "\n".join(
+            f'/bin/systemctl cat {name}.service >/dev/null 2>&1 && /bin/systemctl try-restart {name}.service || true'
+            for name in names
+        )
+    return f"#!/bin/sh\nset -eu\n{body}\n"
+
+
+def acme_validation_args(identity: str, tls: dict) -> list[str]:
+    method = tls["method"]
+    if method == "cloudflare":
+        validation = ["--dns", "dns_cf"]
+    elif method == "http":
+        validation = ["--standalone", "--httpport", str(tls["internal_tcp"])]
+    elif method == "alpn":
+        validation = ["--alpn", "--tlsport", str(tls["internal_tcp"])]
+    else:
+        raise InstallError(f"不支持的自动证书方式：{method}")
+    result = ["--issue", *validation, "-d", identity, "--keylength", "ec-256"]
+    if is_ip_identity(identity):
+        result += ["--certificate-profile", "shortlived"]
+    return result
+
+
+def managed_certificate_paths(identity: str) -> tuple[Path, Path]:
+    safe_name = identity.replace(":", "_")
+    directory = ROOT / "certs" / safe_name
+    return directory / "fullchain.pem", directory / "privkey.pem"
+
+
+def state_without_secrets(answers: dict) -> dict:
+    state = json.loads(json.dumps(answers))
+    state["tls"].pop("_cf_token", None)
+    state["tls"]["token_configured"] = answers["tls"]["method"] == "cloudflare"
+    return state
+
+
+def issue_certificate(system: dict[str, str], identity: str, tls: dict) -> tuple[str, str]:
+    install_acme_client(system, tls.get("email", ""))
+    environment = os.environ.copy()
+    token = tls.get("_cf_token")
+    if token:
+        environment["CF_Token"] = token
+    issue_args = acme_validation_args(identity, tls)
+    with tempfile.TemporaryDirectory(prefix="acme-staging-", dir="/tmp") as directory:
+        staging = Path(directory)
+        run([*acme_command(staging / "config", staging / "certs"), "--server", "letsencrypt_test",
+             *issue_args], env=environment)
+    run([*acme_command(), "--server", "letsencrypt", *issue_args], env=environment)
+
+    cert, key = managed_certificate_paths(identity)
+    cert.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_atomic(ACME_RELOAD, certificate_reload_script(system), 0o755)
+    run([*acme_command(), "--install-cert", "-d", identity, "--ecc",
+         "--fullchain-file", str(cert), "--key-file", str(key),
+         "--reloadcmd", str(ACME_RELOAD)], env=environment)
+    os.chmod(cert, 0o644)
+    os.chmod(key, 0o600)
+    for path in ACME_CONFIG_HOME.rglob("*"):
+        if path.is_file() and path.name.endswith(".conf"):
+            os.chmod(path, 0o600)
+    validate_cert_paths(str(cert), str(key), identity)
+    return str(cert), str(key)
 
 
 def backup_paths(paths: list[Path]) -> Path:
@@ -513,29 +695,38 @@ def check_port_conflicts(ports: list[tuple[int, str]]) -> None:
 
 
 def collect_install_answers() -> dict:
-    print("\n[1/4] 节点身份与 TLS")
-    domain = normalize_node_identity(prompt("节点域名或 IP（必须被证书 SAN 覆盖）"))
-    cert = prompt("HY2 TLS 完整证书路径", "/etc/ssl/node/fullchain.pem")
-    key = prompt("HY2 TLS 私钥路径", "/etc/ssl/node/key.pem")
-    validate_cert_paths(cert, key, domain)
+    print("\n[1/5] 节点地址")
+    detected_ip = detect_public_ip()
+    if detected_ip:
+        print(f"检测到公网出口 IP：{detected_ip}")
+    domain = normalize_node_identity(prompt("节点域名或公网入口 IP", detected_ip))
+    if is_ip_identity(domain) and not yes_no(
+            "检测值可能只是出口 IP，确认它与 NAT 面板的公网入口 IP 相同", False):
+        raise InstallError("请从 NAT 面板确认公网入口 IP，或填写节点域名")
+    tls = collect_tls_answers(domain)
 
-    print("\n[2/4] HY2 直连端口")
+    print("\n[3/5] HY2 直连端口")
     direct_internal = prompt_port("HY2 直连内部 UDP 端口", 5201)
     direct_external = prompt_port("HY2 直连外部 UDP 端口", 45066)
 
-    print("\n[3/4] HY2 中转落地端口")
+    print("\n[4/5] HY2 中转落地端口")
     relay_internal = prompt_port("HY2 中转内部 UDP 端口", 24443)
     relay_external = prompt_port("HY2 中转外部 UDP 端口", 58350)
 
-    print("\n[4/4] Agent 管理端口")
+    print("\n[5/5] Agent 管理端口")
     agent_internal = prompt_port("Agent 内部 TCP 端口", 5201)
     agent_external = prompt_port("Agent 外部 TCP 端口", 45066)
     check_port_conflicts([(direct_internal, "udp"), (relay_internal, "udp"), (agent_internal, "tcp")])
     check_port_conflicts([(direct_external, "udp"), (relay_external, "udp"), (agent_external, "tcp")])
+    if tls.get("internal_tcp") == agent_internal:
+        raise InstallError(f"ACME 与 Agent 不能共用内部 TCP 端口：{agent_internal}")
+    if tls.get("external_tcp") == agent_external:
+        raise InstallError(f"ACME 与 Agent 不能共用外部 TCP 端口：{agent_external}")
     return {
         "domain": domain,
-        "cert": cert,
-        "key": key,
+        "tls": tls,
+        "cert": tls.get("cert"),
+        "key": tls.get("key"),
         "ports": {
             "direct_internal_udp": direct_internal,
             "direct_external_udp": direct_external,
@@ -554,7 +745,9 @@ def install_all() -> None:
     answers = collect_install_answers()
     print("\n即将安装：")
     print(f"  节点身份：{answers['domain']}")
-    print(f"  TLS 证书：{answers['cert']}")
+    print(f"  TLS 证书：{certificate_method_label(answers['tls']['method'])}")
+    if answers["cert"]:
+        print(f"  证书路径：{answers['cert']}")
     show_mapping(answers)
     if not yes_no("确认以上配置并开始安装", False):
         print("已取消，未修改系统")
@@ -565,8 +758,11 @@ def install_all() -> None:
 
     managed = [
         ROOT, AGENT_CONFIG.parent, AGENT_STATE.parent, XRAY_BINARY, AGENT_BINARY,
-        service_file(system, "xui-agent"),
+        service_file(system, "xui-agent"), ACME_RELOAD,
+        Path("/etc/crontabs/root"), Path("/var/spool/cron/crontabs/root"),
     ]
+    if answers["tls"]["method"] != "existing":
+        managed += [ACME_HOME, ACME_CONFIG_HOME, ACME_CERT_HOME]
     for spec in SERVICE_SPECS.values():
         managed += [spec["config"].parent, service_file(system, spec["name"])]
     backup = backup_paths(managed)
@@ -576,6 +772,8 @@ def install_all() -> None:
     os.close(candidate_fd)
     candidate_xray = Path(candidate_name)
     try:
+        if answers["tls"]["method"] != "existing":
+            answers["cert"], answers["key"] = issue_certificate(system, answers["domain"], answers["tls"])
         download_xray(XRAY_VERSION, candidate_xray)
         copy_atomic(candidate_xray, XRAY_BINARY, 0o755)
 
@@ -599,7 +797,6 @@ def install_all() -> None:
         validate_xray(configs)
 
         copy_atomic(packaged_agent, AGENT_BINARY, 0o755)
-        agent_cert, agent_key = make_agent_cert(answers["domain"])
         services = []
         for role, spec in SERVICE_SPECS.items():
             services.append({
@@ -614,8 +811,8 @@ def install_all() -> None:
             "token": credentials["agent_token"],
             "panelGuid": secrets.token_hex(16),
             "statePath": str(AGENT_STATE),
-            "tlsCertFile": agent_cert,
-            "tlsKeyFile": agent_key,
+            "tlsCertFile": answers["cert"],
+            "tlsKeyFile": answers["key"],
             "services": services,
         }
         json_write(AGENT_CONFIG, agent)
@@ -639,7 +836,7 @@ def install_all() -> None:
         answers["xray_version"] = XRAY_VERSION
         answers["system"] = system
         answers["agent_sha256"] = sha256(packaged_agent)
-        json_write(STATE, answers)
+        json_write(STATE, state_without_secrets(answers))
         print("安装完成。请在 NAT 面板添加以下映射：")
         show_mapping(answers)
         print(f"敏感凭据只保存在：{SECRETS}")
@@ -666,6 +863,9 @@ def show_mapping(state: dict | None = None) -> None:
     print(f"  UDP {ports['direct_external_udp']} -> UDP {ports['direct_internal_udp']}  (HY2 直连)")
     print(f"  UDP {ports['relay_external_udp']} -> UDP {ports['relay_internal_udp']}  (HY2 美国中转落地)")
     print(f"  TCP {ports['agent_external_tcp']} -> TCP {ports['agent_internal_tcp']}  (xui-agent)")
+    tls = state.get("tls") or {}
+    if tls.get("external_tcp"):
+        print(f"  TCP {tls['external_tcp']} -> TCP {tls['internal_tcp']}  (ACME 自动续期，必须保留)")
 
 
 def hy2_uri(role: str) -> str:

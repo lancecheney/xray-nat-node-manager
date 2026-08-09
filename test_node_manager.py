@@ -12,20 +12,45 @@ import node_manager as nm
 class ConfigTests(unittest.TestCase):
     def test_install_questions_are_grouped_and_tls_precedes_ports(self):
         answers = iter([
-            "node.example.com", "/cert.pem", "/key.pem",
+            "node.example.com", "3", "/cert.pem", "/key.pem",
             "5201", "45066", "24443", "58350", "5201", "45066",
         ])
         output = io.StringIO()
         with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+                mock.patch.object(nm, "detect_public_ip", return_value=None), \
                 mock.patch.object(nm, "validate_cert_paths") as validate, redirect_stdout(output):
             result = nm.collect_install_answers()
 
         validate.assert_called_once_with("/cert.pem", "/key.pem", "node.example.com")
         rendered = output.getvalue()
-        headings = ["[1/4] 节点身份与 TLS", "[2/4] HY2 直连端口", "[3/4] HY2 中转落地端口", "[4/4] Agent 管理端口"]
+        headings = ["[1/5] 节点地址", "[2/5] TLS 证书", "[3/5] HY2 直连端口", "[4/5] HY2 中转落地端口", "[5/5] Agent 管理端口"]
         positions = [rendered.index(heading) for heading in headings]
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(result["ports"]["relay_external_udp"], 58350)
+
+    def test_acme_modes_match_identity_type(self):
+        cloudflare = nm.acme_validation_args("node.example.com", {"method": "cloudflare"})
+        self.assertIn("dns_cf", cloudflare)
+        self.assertNotIn("shortlived", cloudflare)
+
+        ip_http = nm.acme_validation_args("192.0.2.10", {"method": "http", "internal_tcp": 8080})
+        self.assertIn("--standalone", ip_http)
+        self.assertIn("8080", ip_http)
+        self.assertEqual(ip_http[-2:], ["--certificate-profile", "shortlived"])
+
+    def test_certificate_reload_covers_hy2_and_agent(self):
+        for system in ({"init": "openrc"}, {"init": "systemd"}):
+            script = nm.certificate_reload_script(system)
+            self.assertIn("xray-hy2-direct", script)
+            self.assertIn("xray-hy2-relay", script)
+            self.assertIn("xui-agent", script)
+
+    def test_cloudflare_token_is_not_written_to_node_state(self):
+        state = nm.state_without_secrets({
+            "tls": {"method": "cloudflare", "_cf_token": "secret-token"},
+        })
+        self.assertNotIn("_cf_token", state["tls"])
+        self.assertTrue(state["tls"]["token_configured"])
 
     def test_node_identity_accepts_domains_and_ips(self):
         self.assertEqual(nm.normalize_node_identity("Node.Example.com."), "node.example.com")
