@@ -44,8 +44,36 @@ node-manager
 - 安装、校验或启动任一步骤失败时，自动恢复安装前文件并尝试恢复原服务。
 - 每条 HY2 使用独立认证；不要让直连和中转共用认证。
 
+## Agent 源码与可复现构建
+
+`agent/` 包含随安装器分发的 `xui-agent 0.1.2` 完整 Go 源码。仓库中的 Linux 二进制使用 Go 1.26.5、关闭 CGO 并启用 `-trimpath` 构建：
+
+```sh
+cd agent
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -buildvcs=false -trimpath -ldflags='-s -w' \
+  -o ../assets/xui-agent-linux-amd64 .
+
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -buildvcs=false -trimpath -ldflags='-s -w' \
+  -o ../assets/xui-agent-linux-arm64 .
+```
+
+当前发布文件的 SHA-256：
+
+```text
+6e348045154449fb24cf0e8522740ebcd447c2746e440410189e6557db4d8c85  xui-agent-linux-amd64
+f860d178a75c4ca48a9902d58767ba472a295e141454268c5958ef31865a492b  xui-agent-linux-arm64
+```
+
 ## 测试
 
 ```sh
 python3 -m unittest -v
+
+cd agent
+go test ./...
 ```
+
+本项目使用 [MIT License](LICENSE)。
