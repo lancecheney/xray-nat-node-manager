@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -42,6 +42,7 @@ ACME_HOME = Path("/opt/acme.sh")
 ACME_CONFIG_HOME = Path("/etc/acme.sh")
 ACME_CERT_HOME = Path("/var/lib/acme.sh/certs")
 ACME_RELOAD = Path("/usr/local/sbin/xray-nat-node-manager-cert-reload")
+BBR_SYSCTL_CONFIG = Path("/etc/sysctl.d/99-xray-nat-node-manager-bbr.conf")
 SERVICE_SPECS = {
     "direct": {
         "name": "xray-hy2-direct",
@@ -100,7 +101,7 @@ def require_root_supported() -> dict[str, str]:
     if os.geteuid() != 0:
         raise InstallError("请使用 root 运行")
     system = detect_system()
-    commands = ["openssl"]
+    commands = ["openssl", "sysctl"]
     commands += ["rc-service", "rc-update"] if system["init"] == "openrc" else ["systemctl"]
     for command in commands:
         if shutil.which(command) is None:
@@ -292,6 +293,92 @@ def yes_no(text: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in {"y", "yes", "1", "是"}
+
+
+def sysctl_value(name: str) -> str | None:
+    result = run(["sysctl", "-n", name], check=False, capture=True)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def linux_tcp_bbr_status() -> dict[str, str | None]:
+    return {
+        "congestion_control": sysctl_value("net.ipv4.tcp_congestion_control"),
+        "available": sysctl_value("net.ipv4.tcp_available_congestion_control"),
+        "default_qdisc": sysctl_value("net.core.default_qdisc"),
+    }
+
+
+def linux_tcp_bbr_enabled(status: dict[str, str | None]) -> bool:
+    return status["congestion_control"] == "bbr"
+
+
+def restore_bbr_runtime(status: dict[str, str | None]) -> None:
+    for name, key in (
+        ("net.core.default_qdisc", "default_qdisc"),
+        ("net.ipv4.tcp_congestion_control", "congestion_control"),
+    ):
+        value = status.get(key)
+        if value:
+            run(["sysctl", "-w", f"{name}={value}"], check=False, capture=True)
+
+
+def enable_linux_tcp_bbr(config_path: Path = BBR_SYSCTL_CONFIG) -> dict[str, str | None]:
+    before = linux_tcp_bbr_status()
+    available = (before.get("available") or "").split()
+    if "bbr" not in available and shutil.which("modprobe"):
+        run(["modprobe", "tcp_bbr"], check=False, capture=True)
+        available = (sysctl_value("net.ipv4.tcp_available_congestion_control") or "").split()
+    if "bbr" not in available:
+        raise InstallError("当前内核未提供 TCP BBR；NAT/LXC 可能需要服务商在宿主机开启")
+
+    existed = config_path.exists()
+    old_content = config_path.read_bytes() if existed else None
+    old_mode = config_path.stat().st_mode & 0o777 if existed else 0o644
+    content = (
+        "# Managed by xray-nat-node-manager\n"
+        "net.core.default_qdisc=fq\n"
+        "net.ipv4.tcp_congestion_control=bbr\n"
+    )
+    try:
+        write_atomic(config_path, content, 0o644)
+        result = run(["sysctl", "-p", str(config_path)], check=False, capture=True)
+        after = linux_tcp_bbr_status()
+        if result.returncode != 0 or not linux_tcp_bbr_enabled(after):
+            detail = (result.stdout or "sysctl 未能应用配置").strip()
+            raise InstallError(detail)
+        return after
+    except (InstallError, OSError, subprocess.SubprocessError):
+        if old_content is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            write_atomic(config_path, old_content, old_mode)
+        restore_bbr_runtime(before)
+        raise
+
+
+def check_linux_tcp_bbr() -> None:
+    print("\n[0/6] Linux TCP BBR")
+    status = linux_tcp_bbr_status()
+    if linux_tcp_bbr_enabled(status):
+        print(f"Linux TCP BBR：已开启（default_qdisc={status['default_qdisc'] or 'unknown'}）")
+        print("提示：这是 TCP BBR；HY2 使用独立的 QUIC BBR。")
+        return
+    current = status["congestion_control"] or "unknown"
+    print(f"Linux TCP BBR：未开启（当前：{current}）")
+    if not yes_no("是否现在开启 Linux TCP BBR", True):
+        print("已跳过 Linux TCP BBR，继续安装。")
+        return
+    try:
+        enabled = enable_linux_tcp_bbr()
+    except InstallError as exc:
+        print(f"Linux TCP BBR 开启失败：{exc}")
+        print("已恢复原设置并继续安装；这不影响 HY2 的 QUIC BBR。")
+        return
+    print(f"Linux TCP BBR：已开启（default_qdisc={enabled['default_qdisc'] or 'unknown'}）")
+    print("配置已保存到 /etc/sysctl.d/99-xray-nat-node-manager-bbr.conf")
+    print("提示：这是 TCP BBR；HY2 使用独立的 QUIC BBR。")
 
 
 def stamp() -> str:
@@ -864,6 +951,7 @@ def review_install_answers(answers: dict) -> bool:
 
 def install_all() -> None:
     system = require_root_supported()
+    check_linux_tcp_bbr()
     if STATE.exists() and not yes_no("检测到已有安装，是否覆盖并先备份", False):
         return
     answers = collect_install_answers()

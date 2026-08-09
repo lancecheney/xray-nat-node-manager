@@ -10,6 +10,85 @@ import node_manager as nm
 
 
 class ConfigTests(unittest.TestCase):
+    def test_bbr_already_enabled_reports_status_without_prompting(self):
+        output = io.StringIO()
+        status = {
+            "congestion_control": "bbr",
+            "available": "reno cubic bbr",
+            "default_qdisc": "fq",
+        }
+        with mock.patch.object(nm, "linux_tcp_bbr_status", return_value=status), \
+                mock.patch("builtins.input") as user_input, redirect_stdout(output):
+            nm.check_linux_tcp_bbr()
+
+        user_input.assert_not_called()
+        self.assertIn("Linux TCP BBR：已开启", output.getvalue())
+        self.assertIn("HY2 使用独立的 QUIC BBR", output.getvalue())
+
+    def test_bbr_disabled_can_be_skipped_and_install_continues(self):
+        output = io.StringIO()
+        status = {
+            "congestion_control": "cubic",
+            "available": "reno cubic bbr",
+            "default_qdisc": "fq_codel",
+        }
+        with mock.patch.object(nm, "linux_tcp_bbr_status", return_value=status), \
+                mock.patch("builtins.input", return_value="n"), \
+                mock.patch.object(nm, "enable_linux_tcp_bbr") as enable, redirect_stdout(output):
+            nm.check_linux_tcp_bbr()
+
+        enable.assert_not_called()
+        self.assertIn("已跳过 Linux TCP BBR，继续安装", output.getvalue())
+
+    def test_bbr_enable_uses_managed_sysctl_file_and_verifies_runtime(self):
+        before = {
+            "congestion_control": "cubic",
+            "available": "reno cubic bbr",
+            "default_qdisc": "fq_codel",
+        }
+        after = {
+            "congestion_control": "bbr",
+            "available": "reno cubic bbr",
+            "default_qdisc": "fq",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "99-bbr.conf"
+            completed = subprocess.CompletedProcess([], 0, stdout="applied\n")
+            with mock.patch.object(nm, "linux_tcp_bbr_status", side_effect=[before, after]), \
+                    mock.patch.object(nm, "run", return_value=completed) as run_command:
+                result = nm.enable_linux_tcp_bbr(config)
+
+            self.assertEqual(result, after)
+            self.assertEqual(
+                config.read_text(),
+                "# Managed by xray-nat-node-manager\n"
+                "net.core.default_qdisc=fq\n"
+                "net.ipv4.tcp_congestion_control=bbr\n",
+            )
+            run_command.assert_called_once_with(
+                ["sysctl", "-p", str(config)], check=False, capture=True,
+            )
+
+    def test_bbr_failed_apply_restores_previous_file_and_runtime(self):
+        before = {
+            "congestion_control": "cubic",
+            "available": "reno cubic bbr",
+            "default_qdisc": "fq_codel",
+        }
+        after = {**before}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "99-bbr.conf"
+            config.write_text("old-setting=1\n")
+            failed = subprocess.CompletedProcess([], 1, stdout="permission denied\n")
+            with mock.patch.object(nm, "linux_tcp_bbr_status", side_effect=[before, after]), \
+                    mock.patch.object(nm, "run", return_value=failed), \
+                    mock.patch.object(nm, "restore_bbr_runtime") as restore:
+                with self.assertRaisesRegex(nm.InstallError, "permission denied"):
+                    nm.enable_linux_tcp_bbr(config)
+
+            self.assertEqual(config.read_text(), "old-setting=1\n")
+            restore.assert_called_once_with(before)
+
     def test_install_questions_are_grouped_and_tls_precedes_ports(self):
         answers = iter([
             "1", "node.example.com", "1", "3", "/cert.pem", "/key.pem",

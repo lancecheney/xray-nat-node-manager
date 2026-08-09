@@ -12,6 +12,7 @@
 - 支持 Alpine + OpenRC、Debian/Ubuntu + systemd，安装命令与菜单完全相同。
 - 支持 `x86_64`；仓库加入 arm64 Agent 后也支持 `aarch64`。
 - 支持 Cloudflare DNS-01 无端口自动申请、HTTP-01/TLS-ALPN-01 端口验证，以及已有公网可信证书。
+- 全新安装开始时先检测 Linux TCP BBR；已开启会直接显示状态，未开启则询问是否启用。配置写入独立的 `/etc/sysctl.d/99-xray-nat-node-manager-bbr.conf`，不会重复追加 `/etc/sysctl.conf`。
 - 节点身份可以填写域名或 IP；IP 证书使用 Let’s Encrypt `shortlived` 配置并必须保留自动续期验证端口，通常建议使用域名和 DNS-01。
 - NAT 面板映射和 DNS 记录必须由用户在服务商后台完成。
 - 首版不会自动修改美国 3x-ui；安装完成后会输出美国出站所需的中转 HY2 链接。
@@ -25,6 +26,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 ```
 
 脚本会下载完整安装包、安装必要依赖并自动进入 `node-manager` 交互菜单。选择 `1. 全新安装/重装` 后，程序会先明确选择“使用域名 / 检测 IP / 手动 IP”，域名为推荐默认项；随后选择“端口映射”或“无端口映射”。HY2 与 Agent 的业务端口都必须手动填写；NAT 映射模式分别填写内部监听端口和外部公网端口，无映射模式只填写一个端口。最终汇总页可以单独修改直连、中转或 Agent 端口，不需要全部重填。
+
+在节点地址问题之前，程序会显示 `[0/6] Linux TCP BBR`。判断以 `net.ipv4.tcp_congestion_control` 的实时值为准，不使用可能漏报内核内置功能的 `lsmod | grep bbr`。如果 NAT/LXC 无权修改宿主内核，程序会恢复原配置、说明原因并继续安装。Linux TCP BBR 只影响 TCP；HY2 使用的是 Xray 内部独立配置的 QUIC BBR `standard`。
 
 ## TLS 与自动续期
 
