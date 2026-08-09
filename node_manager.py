@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -167,6 +167,36 @@ def detect_public_ip() -> str | None:
         except (OSError, UnicodeError, ValueError, urllib.error.URLError):
             continue
     return None
+
+
+def collect_node_identity() -> str:
+    print("\n[1/6] 节点地址")
+    detected_ip = detect_public_ip()
+    if detected_ip:
+        print(f"检测到公网出口 IP：{detected_ip}")
+    print(" 1. 使用节点域名（推荐）")
+    if detected_ip:
+        print(f" 2. 使用检测到的 IP：{detected_ip}")
+        print(" 3. 手动填写公网入口 IP")
+    else:
+        print(" 2. 手动填写公网入口 IP")
+    choice = prompt("请选择", "1")
+    if choice == "1":
+        identity = normalize_node_identity(prompt("节点域名"))
+        if is_ip_identity(identity):
+            raise InstallError("这里请选择并填写域名；使用 IP 请返回选择 IP 选项")
+        return identity
+    manual_ip_choice = "3" if detected_ip else "2"
+    if choice == "2" and detected_ip:
+        if not yes_no("检测值可能只是出口 IP，确认它也是本机可接收连接的公网入口 IP", False):
+            raise InstallError("请确认公网入口 IP，或改用节点域名")
+        return detected_ip
+    if choice == manual_ip_choice:
+        identity = normalize_node_identity(prompt("公网入口 IP"))
+        if not is_ip_identity(identity):
+            raise InstallError("公网入口 IP 必须是 IPv4 或 IPv6 地址")
+        return identity
+    raise InstallError("无效的节点地址方式")
 
 
 def certificate_method_label(method: str) -> str:
@@ -718,14 +748,7 @@ def check_port_conflicts(ports: list[tuple[int, str]]) -> None:
 
 
 def collect_install_answers() -> dict:
-    print("\n[1/6] 节点地址")
-    detected_ip = detect_public_ip()
-    if detected_ip:
-        print(f"检测到公网出口 IP：{detected_ip}")
-    domain = normalize_node_identity(prompt("节点域名或公网入口 IP", detected_ip))
-    if is_ip_identity(domain) and not yes_no(
-            "检测值可能只是出口 IP，确认它也是本机可接收连接的公网入口 IP", False):
-        raise InstallError("请确认公网入口 IP，或填写节点域名")
+    domain = collect_node_identity()
     network = collect_network_answers()
     tls = collect_tls_answers(domain, network)
 

@@ -12,7 +12,7 @@ import node_manager as nm
 class ConfigTests(unittest.TestCase):
     def test_install_questions_are_grouped_and_tls_precedes_ports(self):
         answers = iter([
-            "node.example.com", "1", "3", "/cert.pem", "/key.pem",
+            "1", "node.example.com", "1", "3", "/cert.pem", "/key.pem",
             "5201", "45066", "24443", "58350", "5201", "45066",
         ])
         output = io.StringIO()
@@ -31,7 +31,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_direct_mode_uses_one_required_port_for_each_service(self):
         answers = iter([
-            "node.example.com", "2", "3", "/cert.pem", "/key.pem",
+            "1", "node.example.com", "2", "3", "/cert.pem", "/key.pem",
             "12001", "12002", "12003",
         ])
         with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
@@ -44,6 +44,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result["ports"]["direct_external_udp"], 12001)
         self.assertEqual(result["ports"]["agent_internal_tcp"], 12003)
         self.assertEqual(result["ports"]["agent_external_tcp"], 12003)
+
+    def test_node_address_explicitly_selects_domain_or_detected_ip(self):
+        domain_answers = iter(["1", "Node.Example.com"])
+        with mock.patch("builtins.input", side_effect=lambda _: next(domain_answers)), \
+                mock.patch.object(nm, "detect_public_ip", return_value="69.42.222.160"):
+            self.assertEqual(nm.collect_node_identity(), "node.example.com")
+
+        ip_answers = iter(["2", "y"])
+        with mock.patch("builtins.input", side_effect=lambda _: next(ip_answers)), \
+                mock.patch.object(nm, "detect_public_ip", return_value="69.42.222.160"):
+            self.assertEqual(nm.collect_node_identity(), "69.42.222.160")
 
     def test_http_validation_has_fixed_public_port_and_configurable_nat_port(self):
         answers = iter(["2", "18080", "y", "admin@example.com"])
