@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -174,7 +174,7 @@ def certificate_method_label(method: str) -> str:
         "cloudflare": "Cloudflare DNS-01 自动申请（无需端口）",
         "http": "HTTP-01 自动申请（公网 TCP 80）",
         "alpn": "TLS-ALPN-01 自动申请（公网 TCP 443）",
-        "existing": "使用已有证书",
+        "existing": "使用已有公网可信证书",
     }[method]
 
 
@@ -202,13 +202,13 @@ def collect_tls_answers(identity: str, network: dict) -> dict:
     if is_ip_identity(identity):
         print(" 1. HTTP-01 自动申请（公网 TCP 80）")
         print(" 2. TLS-ALPN-01 自动申请（公网 TCP 443）")
-        print(" 3. 使用已有 IP 证书")
+        print(" 3. 使用已有公网可信 IP 证书")
         choice = prompt("请选择", "1")
         methods = {"1": "http", "2": "alpn", "3": "existing"}
     else:
         print(" 1. Cloudflare DNS 自动申请（推荐，无需端口）")
         print(" 2. HTTP-01 自动申请（需要公网 TCP 80）")
-        print(" 3. 使用已有证书")
+        print(" 3. 使用已有公网可信证书")
         choice = prompt("请选择", "1")
         methods = {"1": "cloudflare", "2": "http", "3": "existing"}
     method = methods.get(choice)
@@ -904,9 +904,11 @@ def show_mapping(state: dict | None = None) -> None:
 def show_agent_setup(state: dict | None = None, *, include_token: bool = False) -> None:
     state = state or json.loads(STATE.read_text(encoding="utf-8"))
     print("\n3x-ui Agent 设置：")
+    print("  协议：https")
     print(f"  主机（不含 https://）：{state['domain']}")
     print(f"  端口：{state['ports']['agent_external_tcp']}")
-    print("  HTTPS/SSL：开启")
+    print("  基础路径：/")
+    print("  TLS 校验：标准验证（verify；不要选择固定指纹或跳过验证）")
     if include_token:
         credentials = json.loads(SECRETS.read_text(encoding="utf-8"))
         print(f"  Token：{credentials['agent_token']}")

@@ -69,7 +69,9 @@ class ConfigTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("node.example.com", rendered)
         self.assertIn("45066", rendered)
-        self.assertIn("HTTPS/SSL：开启", rendered)
+        self.assertIn("协议：https", rendered)
+        self.assertIn("标准验证（verify", rendered)
+        self.assertIn("基础路径：/", rendered)
 
     def test_acme_modes_match_identity_type(self):
         cloudflare = nm.acme_validation_args("node.example.com", {"method": "cloudflare"})

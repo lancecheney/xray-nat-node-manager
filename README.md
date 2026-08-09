@@ -11,7 +11,7 @@
 
 - 支持 Alpine + OpenRC、Debian/Ubuntu + systemd，安装命令与菜单完全相同。
 - 支持 `x86_64`；仓库加入 arm64 Agent 后也支持 `aarch64`。
-- 支持 Cloudflare DNS-01 无端口自动申请、HTTP-01/TLS-ALPN-01 端口验证，以及已有证书。
+- 支持 Cloudflare DNS-01 无端口自动申请、HTTP-01/TLS-ALPN-01 端口验证，以及已有公网可信证书。
 - 节点身份可以填写域名或 IP；IP 证书使用 Let’s Encrypt `shortlived` 配置并必须保留自动续期验证端口，通常建议使用域名和 DNS-01。
 - NAT 面板映射和 DNS 记录必须由用户在服务商后台完成。
 - 首版不会自动修改美国 3x-ui；安装完成后会输出美国出站所需的中转 HY2 链接。
@@ -34,7 +34,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 - 自动申请使用固定并校验 SHA-256 的 `acme.sh 3.1.4`，先通过 Let’s Encrypt 测试环境，再申请正式证书。
 - 两套 HY2 与 `xui-agent` 共用同一份证书；续期后同时重启三个服务。
 - Cloudflare Token 由 `acme.sh` 保存在节点本地的 `0600` 配置中，不写入节点状态、链接或安装日志。
-- 安装完成会输出 3x-ui Agent 所需的主机、外部端口和 HTTPS 设置；Token 需通过菜单中的敏感信息选项主动显示。
+- 安装完成会输出 3x-ui Agent 所需的主机、外部端口、基础路径和 HTTPS 设置；公网证书应使用标准 `verify` 校验，不再固定证书指纹。Token 需通过菜单中的敏感信息选项主动显示。
 
 也可以克隆或上传整个仓库后执行：
 
