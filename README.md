@@ -29,7 +29,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 
 ```text
 1. 基础设置（首次使用）
-2. 设置节点
+2. 初始化节点服务
 3. 查看节点连接（包含敏感凭据）
 4. 查看服务状态/端口映射
 5. 设置 Agent
@@ -37,7 +37,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 0. 退出
 ```
 
-首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写两条 HY2 与 Agent 端口。随后选择 `2`，单独创建或修改“HY2 直连”或“HY2 中转落地”；选择 `5` 再单独设置 Agent。修改一条节点会保留另一条节点及现有认证，Agent 已安装时会自动收录当前节点。
+首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写两条 HY2 与 Agent 端口。随后选择 `2`，按需首次创建“HY2 直连”或“HY2 中转落地”独立服务；选择 `5` 再设置 Agent。Agent 接入美国总 3x-ui 后，已有入站和客户端统一在总面板调整，脚本不再提供重复的节点修改入口。若以后需要增加尚未创建的第二个独立服务，仍可通过 `2` 初始化一次；公网外部端口映射始终由 NAT 服务商后台管理。
 
 在节点地址问题之前，程序会显示 `[0/3] Linux TCP BBR`。判断以 `net.ipv4.tcp_congestion_control` 的实时值为准，不使用可能漏报内核内置功能的 `lsmod | grep bbr`。如果 NAT/LXC 无权修改宿主内核，程序会恢复原配置、说明原因并继续安装。Linux TCP BBR 只影响 TCP；HY2 使用的是 Xray 内部独立配置的 QUIC BBR `standard`。
 

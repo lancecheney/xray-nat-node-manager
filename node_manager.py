@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -930,7 +930,7 @@ def show_base_summary(answers: dict) -> None:
 def setup_base() -> None:
     system = require_root_supported()
     if STATE.exists():
-        print("基础设置已经完成；设置或修改线路请选择 2，设置 Agent 请选择 5。")
+        print("基础设置已经完成；初始化新的节点服务请选择 2，设置 Agent 请选择 5。")
         return
     check_linux_tcp_bbr()
     answers = collect_base_answers()
@@ -961,7 +961,7 @@ def setup_base() -> None:
         answers["xray_version"] = XRAY_VERSION
         answers["system"] = system
         json_write(STATE, state_without_secrets(answers))
-        print("基础设置完成。接下来请选择 2 设置需要的节点，或选择 5 设置 Agent。")
+        print("基础设置完成。接下来请选择 2 初始化需要的节点服务，再选择 5 设置 Agent。")
         show_mapping(answers)
     except Exception:
         print(f"基础设置失败，正在恢复：{backup}", file=sys.stderr)
@@ -1017,7 +1017,7 @@ def build_agent_config(state: dict, credentials: dict, system: dict[str, str]) -
         raise InstallError("尚未设置 Agent 端口")
     services = agent_services(state, system)
     if not services:
-        raise InstallError("请先选择 2 至少设置一个节点，再设置 Agent")
+        raise InstallError("请先选择 2 至少初始化一个节点服务，再设置 Agent")
     token, panel_guid = agent_credentials(credentials)
     return {
         "listen": f"0.0.0.0:{state['ports']['agent_internal_tcp']}",
@@ -1053,11 +1053,11 @@ def refresh_agent(system: dict[str, str], state: dict, credentials: dict) -> Non
     run(service_argv(system, "xui-agent", "status"))
 
 
-def configure_node() -> None:
+def initialize_node_service() -> None:
     system = require_root_supported()
     state = load_state()
     credentials = load_secrets()
-    print("\n设置节点：")
+    print("\n初始化节点服务：")
     print(" 1. HY2 直连节点")
     print(" 2. HY2 中转落地节点（供美国入口连接）")
     choice = prompt("请选择", "1")
@@ -1065,7 +1065,9 @@ def configure_node() -> None:
     if role is None:
         raise InstallError("无效的节点类型")
     label = "HY2 直连" if role == "direct" else "HY2 中转落地"
-    if role_is_configured(state, role) and not yes_no(f"{label} 已存在，是否修改端口并保留现有认证", False):
+    if role_is_configured(state, role):
+        print(f"{label} 服务已经初始化。后续入站和客户端请在美国总 3x-ui 面板调整。")
+        print("公网外部端口映射仍需在 NAT 服务商后台管理。")
         return
     print(f"\n[{label}] 端口")
     internal, external = collect_service_ports(label, "UDP", state["network"])
@@ -1113,10 +1115,10 @@ def configure_node() -> None:
         json_write(STATE, state)
         if agent_is_configured(state):
             refresh_agent(system, state, credentials)
-        print(f"{label} 设置完成。")
+        print(f"{label} 服务初始化完成。")
         print("请选择 3. 查看节点连接，按需显示敏感链接。")
     except Exception:
-        print(f"节点设置失败，正在恢复：{backup}", file=sys.stderr)
+        print(f"节点服务初始化失败，正在恢复：{backup}", file=sys.stderr)
         if not service_preexisted:
             run(service_disable_argv(system, spec["name"]), check=False, capture=True)
         restore_backup(backup, system, rollback_services)
@@ -1127,7 +1129,7 @@ def configure_agent() -> None:
     system = require_root_supported()
     state = load_state()
     if not configured_roles(state):
-        raise InstallError("请先选择 2 至少设置一个节点，再设置 Agent")
+        raise InstallError("请先选择 2 至少初始化一个节点服务，再设置 Agent")
     credentials = load_secrets()
     if agent_is_configured(state) and not yes_no("Agent 已存在，是否修改端口并保留现有 Token", False):
         return
@@ -1194,7 +1196,7 @@ def show_mapping(state: dict | None = None) -> None:
         else:
             print(f"  {protocol} {internal}  ({label}，内外相同)")
     if not components:
-        print("  尚未设置节点或 Agent 端口。")
+        print("  尚未初始化节点服务或设置 Agent 端口。")
     tls = state.get("tls") or {}
     if tls.get("external_tcp"):
         if mapped:
@@ -1241,7 +1243,7 @@ def status() -> None:
     if agent_is_configured(state):
         names.append("xui-agent")
     if not names:
-        print("尚未设置节点或 Agent。")
+        print("尚未初始化节点服务或设置 Agent。")
     for name in names:
         result = run(service_argv(system, name, "status"), check=False, capture=True)
         print(f"{name}: {'started' if result.returncode == 0 else 'stopped/error'}")
@@ -1256,7 +1258,7 @@ def print_links() -> None:
     state = load_state()
     roles = configured_roles(state)
     if not roles:
-        raise InstallError("尚未设置节点；请选择 2. 设置节点")
+        raise InstallError("尚未初始化节点服务；请选择 2. 初始化节点服务")
     if "direct" in roles:
         print("直连：", hy2_uri("direct"))
     if "relay" in roles:
@@ -1277,7 +1279,7 @@ def show_status_and_mapping() -> None:
 def menu() -> None:
     actions = {
         "1": ("基础设置（首次使用）", setup_base),
-        "2": ("设置节点", configure_node),
+        "2": ("初始化节点服务", initialize_node_service),
         "3": ("查看节点连接（包含敏感凭据）", print_links),
         "4": ("查看服务状态/端口映射", show_status_and_mapping),
         "5": ("设置 Agent", configure_agent),

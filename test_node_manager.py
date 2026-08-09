@@ -176,6 +176,27 @@ class ConfigTests(unittest.TestCase):
                 state, role="relay", internal=10001, external=20002, protocol="udp",
             )
 
+    def test_existing_node_service_is_managed_from_central_panel(self):
+        state = {
+            "network": {"mode": "mapped"},
+            "ports": {
+                "direct_internal_udp": 10001,
+                "direct_external_udp": 20001,
+            },
+        }
+        output = io.StringIO()
+        with mock.patch.object(nm, "require_root_supported", return_value={"init": "openrc"}), \
+                mock.patch.object(nm, "load_state", return_value=state), \
+                mock.patch.object(nm, "load_secrets", return_value={}), \
+                mock.patch("builtins.input", return_value="1"), \
+                mock.patch.object(nm, "collect_service_ports") as collect_ports, \
+                redirect_stdout(output):
+            nm.initialize_node_service()
+
+        collect_ports.assert_not_called()
+        self.assertIn("美国总 3x-ui 面板调整", output.getvalue())
+        self.assertIn("NAT 服务商后台管理", output.getvalue())
+
     def test_mapping_renders_only_configured_components(self):
         state = {
             "network": {"mode": "mapped"},
@@ -260,7 +281,7 @@ class ConfigTests(unittest.TestCase):
             nm.menu()
         rendered = output.getvalue()
         self.assertIn("1. 基础设置（首次使用）", rendered)
-        self.assertIn("2. 设置节点", rendered)
+        self.assertIn("2. 初始化节点服务", rendered)
         self.assertIn("3. 查看节点连接", rendered)
         self.assertIn("5. 设置 Agent", rendered)
         self.assertIn("6. 查看 Agent 接入信息", rendered)
