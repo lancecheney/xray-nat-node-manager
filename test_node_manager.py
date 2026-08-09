@@ -184,6 +184,59 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result["ports"], {})
         self.assertEqual(result["network"]["mode"], "mapped")
 
+    def test_modifying_base_preserves_ports_and_credentials(self):
+        state = {
+            "domain": "old.example.com",
+            "network": {"mode": "mapped"},
+            "tls": {"method": "existing"},
+            "cert": "/old-cert.pem",
+            "key": "/old-key.pem",
+            "ports": {
+                "direct_internal_udp": 10001,
+                "direct_external_udp": 20001,
+            },
+        }
+        tls = {
+            "method": "existing",
+            "cert": "/new-cert.pem",
+            "key": "/new-key.pem",
+        }
+        credentials = {"direct_auth": "auth", "direct_obfs_password": "obfs"}
+        with mock.patch.object(nm, "yes_no", side_effect=[True, True]), \
+                mock.patch.object(nm, "collect_node_identity", return_value="new.example.com"), \
+                mock.patch.object(nm, "collect_tls_answers", return_value=tls), \
+                mock.patch.object(nm, "load_secrets", return_value=credentials), \
+                mock.patch.object(nm, "backup_paths", return_value=Path("/backup")), \
+                mock.patch.object(nm, "refresh_tls_consumers") as refresh, \
+                mock.patch.object(nm, "json_write") as write, \
+                mock.patch.object(nm, "show_mapping"):
+            nm.modify_base({"init": "openrc"}, state)
+
+        updated = refresh.call_args.args[1]
+        self.assertEqual(updated["domain"], "new.example.com")
+        self.assertEqual(updated["cert"], "/new-cert.pem")
+        self.assertEqual(updated["ports"], state["ports"])
+        self.assertEqual(refresh.call_args.args[2], credentials)
+        self.assertEqual(write.call_args_list[-1].args, (nm.STATE, updated))
+
+    def test_modified_acme_port_cannot_collide_with_reality_or_agent(self):
+        state = {
+            "ports": {
+                "reality_internal_tcp": 10443,
+                "reality_external_tcp": 20443,
+                "agent_internal_tcp": 10003,
+                "agent_external_tcp": 20003,
+            },
+        }
+        with self.assertRaisesRegex(nm.InstallError, "Reality"):
+            nm.validate_tls_ports(
+                state, {"method": "http", "internal_tcp": 10443, "external_tcp": 80},
+            )
+        with self.assertRaisesRegex(nm.InstallError, "Agent"):
+            nm.validate_tls_ports(
+                state, {"method": "http", "internal_tcp": 10003, "external_tcp": 80},
+            )
+
     def test_each_component_collects_only_its_own_ports(self):
         mapped_answers = iter(["12001", "22001"])
         with mock.patch("builtins.input", side_effect=lambda _: next(mapped_answers)):
@@ -381,7 +434,7 @@ class ConfigTests(unittest.TestCase):
         with mock.patch("builtins.input", return_value="0"), redirect_stdout(output):
             nm.menu()
         rendered = output.getvalue()
-        self.assertIn("1. 基础设置（首次使用）", rendered)
+        self.assertIn("1. 基础设置/修改域名证书", rendered)
         self.assertIn("2. 创建节点", rendered)
         self.assertIn("3. 查看节点连接", rendered)
         self.assertIn("5. 设置 Agent", rendered)

@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -249,7 +249,7 @@ def detect_public_ip() -> str | None:
     return None
 
 
-def collect_node_identity() -> str:
+def collect_node_identity(current: str | None = None) -> str:
     print("\n[1/3] 节点地址")
     detected_ip = detect_public_ip()
     if detected_ip:
@@ -262,7 +262,8 @@ def collect_node_identity() -> str:
         print(" 2. 手动填写公网入口 IP")
     choice = prompt("请选择", "1")
     if choice == "1":
-        identity = normalize_node_identity(prompt("节点域名"))
+        default_domain = current if current and not is_ip_identity(current) else None
+        identity = normalize_node_identity(prompt("节点域名", default_domain))
         if is_ip_identity(identity):
             raise InstallError("这里请选择并填写域名；使用 IP 请返回选择 IP 选项")
         return identity
@@ -1417,8 +1418,8 @@ def collect_base_answers() -> dict:
     }
 
 
-def show_base_summary(answers: dict) -> None:
-    print("\n即将完成基础设置：")
+def show_base_summary(answers: dict, title: str = "即将完成基础设置：") -> None:
+    print(f"\n{title}")
     print(f"  节点身份：{answers['domain']}")
     print(f"  端口方式：{'端口映射（NAT）' if answers['network']['mode'] == 'mapped' else '无端口映射（公网机）'}")
     print(f"  TLS 证书：{certificate_method_label(answers['tls']['method'])}")
@@ -1426,10 +1427,111 @@ def show_base_summary(answers: dict) -> None:
         print(f"  证书路径：{answers['cert']}")
 
 
+def validate_tls_ports(state: dict, tls: dict) -> None:
+    internal = tls.get("internal_tcp")
+    external = tls.get("external_tcp")
+    if internal is None or external is None:
+        return
+    ports = state.get("ports") or {}
+    if role_is_configured(state, "reality"):
+        reality_internal, reality_external = role_port_keys("reality")
+        if ports[reality_internal] == internal:
+            raise InstallError(f"ACME 内部 TCP 端口已被 VLESS + Reality 使用：{internal}")
+        if ports[reality_external] == external:
+            raise InstallError(f"ACME 外部 TCP 端口已被 VLESS + Reality 使用：{external}")
+    if agent_is_configured(state):
+        if ports["agent_internal_tcp"] == internal:
+            raise InstallError(f"ACME 内部 TCP 端口已被 Agent 使用：{internal}")
+        if ports["agent_external_tcp"] == external:
+            raise InstallError(f"ACME 外部 TCP 端口已被 Agent 使用：{external}")
+
+
+def refresh_tls_consumers(system: dict[str, str], state: dict, credentials: dict) -> None:
+    configs = []
+    roles = []
+    for role in ("direct", "relay"):
+        if not role_is_configured(state, role):
+            continue
+        spec = SERVICE_SPECS[role]
+        internal_key, _ = role_port_keys(role)
+        auth = credentials.get(f"{role}_auth")
+        obfs_password = credentials.get(f"{role}_obfs_password")
+        if not auth or not obfs_password:
+            raise InstallError(f"{spec['label']} 缺少原有凭据，无法安全更新证书")
+        config = hy2_config(
+            domain=state["domain"], port=state["ports"][internal_key],
+            cert=state["cert"], key=state["key"], auth=auth,
+            obfs_password=obfs_password, spec=spec,
+        )
+        json_write(spec["config"], config)
+        configs.append(spec["config"])
+        roles.append(role)
+    validate_xray(configs)
+    for role in roles:
+        name = SERVICE_SPECS[role]["name"]
+        run(service_argv(system, name, "restart"))
+        run(service_argv(system, name, "status"))
+    if agent_is_configured(state):
+        refresh_agent(system, state, credentials)
+
+
+def modify_base(system: dict[str, str], state: dict) -> None:
+    show_base_summary(state, "当前基础设置：")
+    print("  现有节点端口、凭据和 Agent Token 将保持不变。")
+    if not yes_no("是否修改节点域名和 TLS 证书", False):
+        print("已取消，未修改基础设置")
+        return
+
+    domain = collect_node_identity(state.get("domain"))
+    tls = collect_tls_answers(domain, state["network"])
+    validate_tls_ports(state, tls)
+    updated = json.loads(json.dumps(state))
+    updated["domain"] = domain
+    updated["tls"] = tls
+    updated["cert"] = tls.get("cert")
+    updated["key"] = tls.get("key")
+    show_base_summary(updated)
+    if not yes_no("确认修改域名和证书", True):
+        print("已取消，未修改系统")
+        return
+
+    credentials = load_secrets()
+    managed = [
+        ROOT, ACME_RELOAD,
+        Path("/etc/crontabs/root"), Path("/var/spool/cron/crontabs/root"),
+    ]
+    rollback_services = []
+    for role in ("direct", "relay"):
+        if role_is_configured(state, role):
+            managed.append(SERVICE_SPECS[role]["config"].parent)
+            rollback_services.append(SERVICE_SPECS[role]["name"])
+    if agent_is_configured(state):
+        managed += [AGENT_CONFIG.parent, AGENT_STATE.parent]
+        rollback_services.append("xui-agent")
+    if tls["method"] != "existing":
+        managed += [ACME_HOME, ACME_CONFIG_HOME, ACME_CERT_HOME]
+    backup = backup_paths(managed)
+    print(f"备份：{backup}")
+    try:
+        if tls["method"] != "existing":
+            updated["cert"], updated["key"] = issue_certificate(system, domain, tls)
+        updated["tls"] = state_without_secrets({"tls": tls})["tls"]
+        updated["updated_at"] = stamp()
+        refresh_tls_consumers(system, updated, credentials)
+        json_write(SECRETS, credentials)
+        json_write(STATE, updated)
+        print("节点域名和 TLS 证书修改完成。")
+        show_mapping(updated)
+    except Exception:
+        print(f"基础设置修改失败，正在恢复：{backup}", file=sys.stderr)
+        restore_backup(backup, system, rollback_services)
+        raise
+
+
 def setup_base() -> None:
     system = require_root_supported()
     if STATE.exists():
-        print("基础设置已经完成；创建节点请选择 2，设置 Agent 请选择 5。")
+        modify_base(system, load_state())
         return
     check_linux_tcp_bbr()
     answers = collect_base_answers()
@@ -1843,7 +1945,7 @@ def show_status_and_mapping() -> None:
 
 def menu() -> None:
     actions = {
-        "1": ("基础设置（首次使用）", setup_base),
+        "1": ("基础设置/修改域名证书", setup_base),
         "2": ("创建节点", create_node),
         "3": ("查看节点连接（包含敏感凭据）", print_links),
         "4": ("查看服务状态/端口映射", show_status_and_mapping),

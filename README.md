@@ -29,7 +29,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 脚本会下载完整安装包、安装必要依赖并自动进入模块化菜单：
 
 ```text
-1. 基础设置（首次使用）
+1. 基础设置/修改域名证书
 2. 创建节点
 3. 查看节点连接（包含敏感凭据）
 4. 查看服务状态/端口映射
@@ -38,7 +38,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 0. 退出
 ```
 
-首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写节点与 Agent 端口。随后选择 `2`，按需创建“HY2 直连”“HY2 中转落地（供中转接入）”或“VLESS + Reality”独立服务；选择 `5` 再设置 Agent。Agent 接入 3x-ui 总面板后，已有入站和客户端统一在总面板调整，脚本不再提供重复的节点修改入口。以后需要增加尚未创建的节点类型，仍可通过 `2` 创建；公网外部端口映射始终由 NAT 服务商后台管理。
+首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写节点与 Agent 端口。基础设置完成后再次选择 `1`，可以修改节点域名和 TLS 证书；现有节点端口、凭据和 Agent Token 保持不变，HY2 与 Agent 配置会验证后自动切换到新证书。端口方式不在修改流程中重选，避免破坏已有 NAT 映射。随后选择 `2`，按需创建“HY2 直连”“HY2 中转落地（供中转接入）”或“VLESS + Reality”独立服务；选择 `5` 再设置 Agent。Agent 接入 3x-ui 总面板后，已有入站和客户端统一在总面板调整，脚本不再提供重复的节点修改入口。以后需要增加尚未创建的节点类型，仍可通过 `2` 创建；公网外部端口映射始终由 NAT 服务商后台管理。
 
 两条 HY2 当前保持为两个独立 Xray 服务，因此不能共用同一个内部 UDP 端口；若合并成单个入站才可通过不同认证用户共用端口。VLESS Reality 使用 TCP，HY2 使用 UDP，所以二者可以使用相同的端口数字，但 NAT 面板必须分别建立 TCP 与 UDP 映射。
 
