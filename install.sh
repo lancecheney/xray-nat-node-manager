@@ -6,6 +6,25 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+base_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# Running the raw script does not provide the manager or packaged Agent
+# binaries. In that case, bootstrap the complete public repository first.
+if [ ! -f "$base_dir/node_manager.py" ] || [ ! -d "$base_dir/assets" ]; then
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "远程安装需要 curl" >&2
+    exit 1
+  fi
+  bootstrap_dir=$(mktemp -d /tmp/xray-nat-node-manager.XXXXXX)
+  trap 'rm -rf -- "$bootstrap_dir"' EXIT
+  curl -fsSL \
+    https://github.com/lancecheney/xray-nat-node-manager/archive/refs/heads/main.tar.gz \
+    -o "$bootstrap_dir/source.tar.gz"
+  tar -xzf "$bootstrap_dir/source.tar.gz" -C "$bootstrap_dir"
+  sh "$bootstrap_dir/xray-nat-node-manager-main/install.sh"
+  exit
+fi
+
 if [ ! -r /etc/os-release ]; then
   echo "无法识别系统：缺少 /etc/os-release" >&2
   exit 1
@@ -29,7 +48,6 @@ case "${ID:-}" in
     ;;
 esac
 
-base_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 install -d -m 0755 /usr/local/lib/xray-nat-node-manager/assets
 install -m 0755 "$base_dir/node_manager.py" /usr/local/lib/xray-nat-node-manager/node_manager.py
 
@@ -39,4 +57,5 @@ for asset in "$base_dir"/assets/xui-agent-linux-*; do
 done
 
 ln -sf /usr/local/lib/xray-nat-node-manager/node_manager.py /usr/local/sbin/node-manager
-echo "安装完成，运行：node-manager"
+echo "安装完成，正在启动 node-manager"
+exec /usr/local/sbin/node-manager

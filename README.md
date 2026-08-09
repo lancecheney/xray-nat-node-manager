@@ -17,15 +17,20 @@
 
 ## 安装
 
-把整个仓库上传到新机器，然后执行：
+使用 root 在新机器执行一条命令：
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh)
+```
+
+脚本会下载完整安装包、安装必要依赖并自动进入 `node-manager` 交互菜单。选择 `1. 全新安装/重装`，按提示填写域名、证书路径以及内外端口。
+
+也可以克隆或上传整个仓库后执行：
 
 ```sh
 chmod +x install.sh node_manager.py
 ./install.sh
-node-manager
 ```
-
-选择 `1. 全新安装/重装`，按提示填写域名、证书路径以及内外端口。
 
 安装生成的凭据仅保存在新机器：
 
