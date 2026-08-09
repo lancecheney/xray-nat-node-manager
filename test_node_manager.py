@@ -56,6 +56,28 @@ class ConfigTests(unittest.TestCase):
                 mock.patch.object(nm, "detect_public_ip", return_value="69.42.222.160"):
             self.assertEqual(nm.collect_node_identity(), "69.42.222.160")
 
+    def test_summary_can_edit_one_port_section_without_restarting(self):
+        state = {
+            "domain": "node.example.com",
+            "network": {"mode": "mapped"},
+            "tls": {"method": "cloudflare"},
+            "cert": None,
+            "ports": {
+                "direct_internal_udp": 10001,
+                "direct_external_udp": 20001,
+                "relay_internal_udp": 10002,
+                "relay_external_udp": 20002,
+                "agent_internal_tcp": 10003,
+                "agent_external_tcp": 20003,
+            },
+        }
+        answers = iter(["2", "11001", "21001", "1"])
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
+            self.assertTrue(nm.review_install_answers(state))
+        self.assertEqual(state["ports"]["direct_internal_udp"], 11001)
+        self.assertEqual(state["ports"]["direct_external_udp"], 21001)
+        self.assertEqual(state["ports"]["relay_internal_udp"], 10002)
+
     def test_http_validation_has_fixed_public_port_and_configurable_nat_port(self):
         answers = iter(["2", "18080", "y", "admin@example.com"])
         with mock.patch("builtins.input", side_effect=lambda _: next(answers)):

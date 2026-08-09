@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -766,6 +766,25 @@ def check_port_conflicts(ports: list[tuple[int, str]]) -> None:
         seen.add(key)
 
 
+def validate_install_ports(answers: dict) -> None:
+    ports = answers["ports"]
+    tls = answers["tls"]
+    check_port_conflicts([
+        (ports["direct_internal_udp"], "udp"),
+        (ports["relay_internal_udp"], "udp"),
+        (ports["agent_internal_tcp"], "tcp"),
+    ])
+    check_port_conflicts([
+        (ports["direct_external_udp"], "udp"),
+        (ports["relay_external_udp"], "udp"),
+        (ports["agent_external_tcp"], "tcp"),
+    ])
+    if tls.get("internal_tcp") == ports["agent_internal_tcp"]:
+        raise InstallError(f"ACME 与 Agent 不能共用内部 TCP 端口：{ports['agent_internal_tcp']}")
+    if tls.get("external_tcp") == ports["agent_external_tcp"]:
+        raise InstallError(f"ACME 与 Agent 不能共用外部 TCP 端口：{ports['agent_external_tcp']}")
+
+
 def collect_install_answers() -> dict:
     domain = collect_node_identity()
     network = collect_network_answers()
@@ -779,13 +798,7 @@ def collect_install_answers() -> dict:
 
     print("\n[6/6] Agent 管理端口")
     agent_internal, agent_external = collect_service_ports("Agent 管理", "TCP", network)
-    check_port_conflicts([(direct_internal, "udp"), (relay_internal, "udp"), (agent_internal, "tcp")])
-    check_port_conflicts([(direct_external, "udp"), (relay_external, "udp"), (agent_external, "tcp")])
-    if tls.get("internal_tcp") == agent_internal:
-        raise InstallError(f"ACME 与 Agent 不能共用内部 TCP 端口：{agent_internal}")
-    if tls.get("external_tcp") == agent_external:
-        raise InstallError(f"ACME 与 Agent 不能共用外部 TCP 端口：{agent_external}")
-    return {
+    answers = {
         "domain": domain,
         "network": network,
         "tls": tls,
@@ -800,6 +813,53 @@ def collect_install_answers() -> dict:
             "agent_external_tcp": agent_external,
         },
     }
+    validate_install_ports(answers)
+    return answers
+
+
+def show_install_summary(answers: dict) -> None:
+    print("\n即将安装：")
+    print(f"  节点身份：{answers['domain']}")
+    print(f"  TLS 证书：{certificate_method_label(answers['tls']['method'])}")
+    if answers["cert"]:
+        print(f"  证书路径：{answers['cert']}")
+    show_mapping(answers)
+
+
+def review_install_answers(answers: dict) -> bool:
+    while True:
+        show_install_summary(answers)
+        print("\n 1. 确认并开始安装")
+        print(" 2. 修改 HY2 直连端口")
+        print(" 3. 修改 HY2 中转端口")
+        print(" 4. 修改 Agent 管理端口")
+        print(" 0. 取消")
+        choice = prompt("请选择", "1")
+        if choice == "1":
+            return True
+        if choice == "0":
+            return False
+        old_ports = answers["ports"].copy()
+        if choice == "2":
+            internal, external = collect_service_ports("HY2 直连", "UDP", answers["network"])
+            answers["ports"]["direct_internal_udp"] = internal
+            answers["ports"]["direct_external_udp"] = external
+        elif choice == "3":
+            internal, external = collect_service_ports("HY2 中转落地", "UDP", answers["network"])
+            answers["ports"]["relay_internal_udp"] = internal
+            answers["ports"]["relay_external_udp"] = external
+        elif choice == "4":
+            internal, external = collect_service_ports("Agent 管理", "TCP", answers["network"])
+            answers["ports"]["agent_internal_tcp"] = internal
+            answers["ports"]["agent_external_tcp"] = external
+        else:
+            print("无效选择")
+            continue
+        try:
+            validate_install_ports(answers)
+        except InstallError as exc:
+            answers["ports"] = old_ports
+            print(f"端口修改无效：{exc}")
 
 
 def install_all() -> None:
@@ -807,13 +867,7 @@ def install_all() -> None:
     if STATE.exists() and not yes_no("检测到已有安装，是否覆盖并先备份", False):
         return
     answers = collect_install_answers()
-    print("\n即将安装：")
-    print(f"  节点身份：{answers['domain']}")
-    print(f"  TLS 证书：{certificate_method_label(answers['tls']['method'])}")
-    if answers["cert"]:
-        print(f"  证书路径：{answers['cert']}")
-    show_mapping(answers)
-    if not yes_no("确认以上配置并开始安装", False):
+    if not review_install_answers(answers):
         print("已取消，未修改系统")
         return
     packaged_agent = Path(__file__).resolve().parent / "assets" / xray_asset_for_agent()
