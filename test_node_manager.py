@@ -242,6 +242,31 @@ class ConfigTests(unittest.TestCase):
                 state, role="relay", internal=10001, external=20002, protocol="udp",
             )
 
+    def test_tcp_reality_can_use_same_port_number_as_udp_hy2(self):
+        state = {
+            "ports": {
+                "direct_internal_udp": 10001,
+                "direct_external_udp": 20001,
+            },
+            "tls": {},
+        }
+        nm.validate_component_ports(
+            state, role="reality", internal=10001, external=20001, protocol="tcp",
+        )
+
+    def test_two_independent_hy2_nodes_cannot_share_udp_port(self):
+        state = {
+            "ports": {
+                "direct_internal_udp": 10001,
+                "direct_external_udp": 20001,
+            },
+            "tls": {},
+        }
+        with self.assertRaisesRegex(nm.InstallError, "HY2 直连"):
+            nm.validate_component_ports(
+                state, role="relay", internal=10001, external=20001, protocol="udp",
+            )
+
     def test_existing_node_service_is_managed_from_central_panel(self):
         state = {
             "network": {"mode": "mapped"},
@@ -257,10 +282,10 @@ class ConfigTests(unittest.TestCase):
                 mock.patch("builtins.input", return_value="1"), \
                 mock.patch.object(nm, "collect_service_ports") as collect_ports, \
                 redirect_stdout(output):
-            nm.initialize_node_service()
+            nm.create_node()
 
         collect_ports.assert_not_called()
-        self.assertIn("美国总 3x-ui 面板调整", output.getvalue())
+        self.assertIn("3x-ui 总面板调整", output.getvalue())
         self.assertIn("NAT 服务商后台管理", output.getvalue())
 
     def test_mapping_renders_only_configured_components(self):
@@ -277,7 +302,7 @@ class ConfigTests(unittest.TestCase):
             nm.show_mapping(state)
         rendered = output.getvalue()
         self.assertIn("UDP 20001 -> UDP 10001", rendered)
-        self.assertNotIn("HY2 美国中转落地", rendered)
+        self.assertNotIn("HY2 中转落地", rendered)
         self.assertNotIn("xui-agent", rendered)
 
     def test_http_validation_has_fixed_public_port_and_configurable_nat_port(self):
@@ -341,13 +366,23 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([service["name"] for service in services], ["xray-hy2-relay"])
         self.assertTrue(services[0]["default"])
 
+    def test_agent_services_support_reality_node(self):
+        state = {
+            "ports": {
+                "reality_internal_tcp": 10443,
+                "reality_external_tcp": 20443,
+            },
+        }
+        services = nm.agent_services(state, {"init": "openrc"})
+        self.assertEqual([service["name"] for service in services], ["xray-vless-reality"])
+
     def test_menu_exposes_modular_setup_actions(self):
         output = io.StringIO()
         with mock.patch("builtins.input", return_value="0"), redirect_stdout(output):
             nm.menu()
         rendered = output.getvalue()
         self.assertIn("1. 基础设置（首次使用）", rendered)
-        self.assertIn("2. 初始化节点服务", rendered)
+        self.assertIn("2. 创建节点", rendered)
         self.assertIn("3. 查看节点连接", rendered)
         self.assertIn("5. 设置 Agent", rendered)
         self.assertIn("6. 查看 Agent 接入信息", rendered)
@@ -367,6 +402,7 @@ class ConfigTests(unittest.TestCase):
             script = nm.certificate_reload_script(system)
             self.assertIn("xray-hy2-direct", script)
             self.assertIn("xray-hy2-relay", script)
+            self.assertNotIn("xray-vless-reality", script)
             self.assertIn("xui-agent", script)
 
     def test_cloudflare_token_is_not_written_to_node_state(self):
@@ -477,6 +513,8 @@ class ConfigTests(unittest.TestCase):
         }
         configs = {}
         for role, spec in nm.SERVICE_SPECS.items():
+            if spec["protocol"] != "hy2":
+                continue
             auth, obfs = credentials[role]
             configs[role] = nm.hy2_config(
                 domain="node.example.com",
@@ -499,8 +537,76 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(quic["bbrProfile"], "standard")
             self.assertEqual(inbound["streamSettings"]["tlsSettings"]["alpn"], ["h3"])
 
+    def test_reality_config_uses_vision_and_minimum_client_version(self):
+        spec = nm.SERVICE_SPECS["reality"]
+        config = nm.reality_config(
+            port=10443,
+            target="target.example.com",
+            target_port=443,
+            client_id="11111111-1111-4111-8111-111111111111",
+            private_key="private-key",
+            short_id="0123456789abcdef",
+            spec=spec,
+        )
+        inbound = config["inbounds"][0]
+        self.assertEqual(inbound["protocol"], "vless")
+        self.assertEqual(inbound["settings"]["clients"][0]["flow"], "xtls-rprx-vision")
+        self.assertEqual(inbound["streamSettings"]["method"], "raw")
+        reality = inbound["streamSettings"]["realitySettings"]
+        self.assertEqual(reality["target"], "target.example.com:443")
+        self.assertEqual(reality["minClientVer"], "1.0.0")
+
+    def test_reality_key_parser_supports_current_xray_output(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout="PrivateKey: private-value\nPassword (PublicKey): public-value\n",
+        )
+        with mock.patch.object(nm, "run", return_value=completed):
+            self.assertEqual(
+                nm.generate_reality_key_pair(),
+                ("private-value", "public-value"),
+            )
+
+    def test_reality_target_requires_successful_tls_13_handshake(self):
+        success = subprocess.CompletedProcess(
+            [], 0, stdout="Handshake succeeded\nTLS Version: TLS 1.3\n",
+        )
+        answers = iter(["target.example.com", ""])
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+                mock.patch.object(nm, "run", return_value=success):
+            self.assertEqual(nm.collect_reality_target(), ("target.example.com", 443))
+
+        tls12 = subprocess.CompletedProcess(
+            [], 0, stdout="Handshake succeeded\nTLS Version: TLS 1.2\n",
+        )
+        answers = iter(["target.example.com", ""])
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+                mock.patch.object(nm, "run", return_value=tls12):
+            with self.assertRaisesRegex(nm.InstallError, "TLS 1.3"):
+                nm.collect_reality_target()
+
+    def test_reality_link_uses_public_nat_port(self):
+        state = {
+            "domain": "node.example.com",
+            "ports": {"reality_internal_tcp": 10443, "reality_external_tcp": 20443},
+            "reality": {"target": "target.example.com", "target_port": 443},
+        }
+        credentials = {
+            "reality_client_id": "11111111-1111-4111-8111-111111111111",
+            "reality_public_key": "public-key",
+            "reality_short_id": "0123456789abcdef",
+        }
+        with mock.patch.object(nm, "load_state", return_value=state), \
+                mock.patch.object(nm, "load_secrets", return_value=credentials):
+            link = nm.reality_uri()
+        self.assertIn("node.example.com:20443", link)
+        self.assertIn("security=reality", link)
+        self.assertIn("sni=target.example.com", link)
+        self.assertIn("pbk=public-key", link)
+
     def test_each_inbound_has_explicit_direct_route(self):
         for spec in nm.SERVICE_SPECS.values():
+            if spec["protocol"] != "hy2":
+                continue
             config = nm.hy2_config(
                 domain="node.example.com", port=12345, cert="/cert.pem", key="/key.pem",
                 auth="auth", obfs_password="obfs", spec=spec,

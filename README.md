@@ -1,10 +1,11 @@
 # Xray NAT Node Manager
 
-面向轻量 NAT/LXC 的交互式命令行安装器。它安装官方 Xray，创建两个相互隔离的 Xray Hysteria 2 服务，并安装轻量 `xui-agent`：
+面向轻量 NAT/LXC 的交互式命令行安装器。它安装官方 Xray，按需创建相互隔离的节点服务，并安装轻量 `xui-agent`：
 
 - HY2 直连：客户端直接进入新节点。
-- HY2 中转落地：美国入口通过第二条 HY2 进入新节点。
-- 两条线路使用不同的内部端口、认证、Salamander 密码、服务、配置、日志和统计 API。
+- HY2 中转落地：供任意中转服务器接入，不绑定特定国家或机器。
+- VLESS + Reality：使用 RAW、XTLS Vision、Chrome 指纹和独立 Reality 密钥。
+- 各节点使用独立的认证、服务、配置、日志和统计 API。
 - QUIC 拥塞控制固定为 BBR `standard`，窗口沿用已验证的 8/20 MiB。
 
 ## 当前范围
@@ -15,7 +16,7 @@
 - 全新安装开始时先检测 Linux TCP BBR；已开启会直接显示状态，未开启则询问是否启用。配置写入独立的 `/etc/sysctl.d/99-xray-nat-node-manager-bbr.conf`，不会重复追加 `/etc/sysctl.conf`。
 - 节点身份可以填写域名或 IP；IP 证书使用 Let’s Encrypt `shortlived` 配置并必须保留自动续期验证端口，通常建议使用域名和 DNS-01。
 - NAT 面板映射和 DNS 记录必须由用户在服务商后台完成。
-- 首版不会自动修改美国 3x-ui；安装完成后会输出美国出站所需的中转 HY2 链接。
+- 脚本不会自动修改 3x-ui 总面板；创建完成后会输出直连或供中转接入所需的节点链接。
 
 ## 安装
 
@@ -29,7 +30,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 
 ```text
 1. 基础设置（首次使用）
-2. 初始化节点服务
+2. 创建节点
 3. 查看节点连接（包含敏感凭据）
 4. 查看服务状态/端口映射
 5. 设置 Agent
@@ -37,7 +38,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 0. 退出
 ```
 
-首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写两条 HY2 与 Agent 端口。随后选择 `2`，按需首次创建“HY2 直连”或“HY2 中转落地”独立服务；选择 `5` 再设置 Agent。Agent 接入美国总 3x-ui 后，已有入站和客户端统一在总面板调整，脚本不再提供重复的节点修改入口。若以后需要增加尚未创建的第二个独立服务，仍可通过 `2` 初始化一次；公网外部端口映射始终由 NAT 服务商后台管理。
+首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写节点与 Agent 端口。随后选择 `2`，按需创建“HY2 直连”“HY2 中转落地（供中转接入）”或“VLESS + Reality”独立服务；选择 `5` 再设置 Agent。Agent 接入 3x-ui 总面板后，已有入站和客户端统一在总面板调整，脚本不再提供重复的节点修改入口。以后需要增加尚未创建的节点类型，仍可通过 `2` 创建；公网外部端口映射始终由 NAT 服务商后台管理。
+
+两条 HY2 当前保持为两个独立 Xray 服务，因此不能共用同一个内部 UDP 端口；若合并成单个入站才可通过不同认证用户共用端口。VLESS Reality 使用 TCP，HY2 使用 UDP，所以二者可以使用相同的端口数字，但 NAT 面板必须分别建立 TCP 与 UDP 映射。
 
 在节点地址问题之前，程序会显示 `[0/3] Linux TCP BBR`。判断以 `net.ipv4.tcp_congestion_control` 的实时值为准，不使用可能漏报内核内置功能的 `lsmod | grep bbr`。如果 NAT/LXC 无权修改宿主内核，程序会恢复原配置、说明原因并继续安装。Linux TCP BBR 只影响 TCP；HY2 使用的是 Xray 内部独立配置的 QUIC BBR `standard`。
 
@@ -48,7 +51,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 - HTTP-01 的公网验证端口固定为 TCP 80；NAT 模式可将它映射到手动填写的内部 TCP 端口。
 - IP 证书还可使用 TLS-ALPN-01，其公网验证端口固定为 TCP 443；NAT 模式可映射到其他内部 TCP 端口。
 - 自动申请使用固定并校验 SHA-256 的 `acme.sh 3.1.4`，先通过 Let’s Encrypt 测试环境，再申请正式证书。
-- 两套 HY2 与 `xui-agent` 共用同一份证书；续期后同时重启三个服务。
+- 两套 HY2 与 `xui-agent` 共用同一份证书；续期后重启使用该证书的服务。Reality 不使用这份 TLS 证书。
 - Cloudflare Token 由 `acme.sh` 保存在节点本地的 `0600` 配置中，不写入节点状态、链接或安装日志。
 - 安装完成会输出 3x-ui Agent 所需的主机、外部端口、基础路径和 HTTPS 设置；公网证书应使用标准 `verify` 校验，不再固定证书指纹。Token 需通过菜单中的敏感信息选项主动显示。
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive lightweight NAT node manager for two isolated Xray HY2 services."""
+"""Interactive lightweight NAT node manager for isolated Xray node services."""
 
 from __future__ import annotations
 
@@ -22,11 +22,12 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 
 
-VERSION = "0.4.5"
+VERSION = "0.5.0"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -50,6 +51,10 @@ SERVICE_SPECS = {
         "api_port": 10085,
         "tag": "hy2-direct-in",
         "email": "hy2-direct",
+        "label": "HY2 直连",
+        "protocol": "hy2",
+        "port_protocol": "UDP",
+        "uses_tls_cert": True,
     },
     "relay": {
         "name": "xray-hy2-relay",
@@ -57,6 +62,21 @@ SERVICE_SPECS = {
         "api_port": 10086,
         "tag": "hy2-relay-in",
         "email": "hy2-relay",
+        "label": "HY2 中转落地（供中转接入）",
+        "protocol": "hy2",
+        "port_protocol": "UDP",
+        "uses_tls_cert": True,
+    },
+    "reality": {
+        "name": "xray-vless-reality",
+        "config": Path("/etc/xray-vless-reality/config.json"),
+        "api_port": 10087,
+        "tag": "vless-reality-in",
+        "email": "vless-reality",
+        "label": "VLESS + Reality",
+        "protocol": "reality",
+        "port_protocol": "TCP",
+        "uses_tls_cert": False,
     },
 }
 
@@ -156,8 +176,8 @@ def prompt(text: str, default: str | None = None, *, secret: bool = False) -> st
     return value
 
 
-def prompt_port(text: str) -> int:
-    value = int(prompt(text))
+def prompt_port(text: str, default: int | None = None) -> int:
+    value = int(prompt(text, str(default) if default is not None else None))
     if not 1 <= value <= 65535:
         raise InstallError(f"端口超出范围：{value}")
     return value
@@ -584,10 +604,116 @@ def hy2_config(*, domain: str, port: int, cert: str, key: str, auth: str,
     }
 
 
+def reality_config(*, port: int, target: str, target_port: int, client_id: str,
+                   private_key: str, short_id: str, spec: dict) -> dict:
+    return {
+        "log": {"loglevel": "warning"},
+        "api": {"tag": "api", "services": ["StatsService"]},
+        "stats": {},
+        "policy": {
+            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            "system": {
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+            },
+        },
+        "inbounds": [
+            {
+                "tag": spec["tag"],
+                "listen": "0.0.0.0",
+                "port": port,
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{
+                        "id": client_id,
+                        "email": spec["email"],
+                        "flow": "xtls-rprx-vision",
+                    }],
+                    "decryption": "none",
+                },
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"]},
+                "streamSettings": {
+                    "method": "raw",
+                    "security": "reality",
+                    "realitySettings": {
+                        "show": False,
+                        "target": f"{target}:{target_port}",
+                        "xver": 0,
+                        "serverNames": [target],
+                        "privateKey": private_key,
+                        "minClientVer": "1.0.0",
+                        "maxClientVer": "",
+                        "maxTimeDiff": 0,
+                        "shortIds": [short_id],
+                    },
+                },
+            },
+            {
+                "tag": "api",
+                "listen": "127.0.0.1",
+                "port": spec["api_port"],
+                "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"},
+            },
+        ],
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "blocked", "protocol": "blackhole"},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                {"type": "field", "inboundTag": [spec["tag"]], "outboundTag": "direct"},
+                {"type": "field", "network": "tcp,udp", "outboundTag": "blocked"},
+            ],
+        },
+    }
+
+
+def generate_reality_key_pair() -> tuple[str, str]:
+    result = run([str(XRAY_BINARY), "x25519"], check=False, capture=True)
+    if result.returncode != 0:
+        raise InstallError(f"生成 Reality 密钥失败：\n{result.stdout}")
+    private_match = re.search(r"(?:Private key|PrivateKey):\s*(\S+)", result.stdout, re.IGNORECASE)
+    public_match = re.search(
+        r"(?:Password(?: \(PublicKey\))?|Public key|PublicKey):\s*(\S+)",
+        result.stdout,
+        re.IGNORECASE,
+    )
+    if not private_match or not public_match:
+        raise InstallError("无法识别 Xray 生成的 Reality 密钥")
+    return private_match.group(1), public_match.group(1)
+
+
+def collect_reality_target() -> tuple[str, int]:
+    print("\n[Reality] 伪装目标")
+    print("  请填写本机网络可稳定访问、支持 TLS 1.3 的站点；不要填写 CDN 共用入口。")
+    target = normalize_node_identity(prompt("Reality 目标域名"))
+    if is_ip_identity(target):
+        raise InstallError("Reality 目标请填写域名，不要填写 IP")
+    target_port = prompt_port("Reality 目标端口", 443)
+    result = run(
+        [str(XRAY_BINARY), "tls", "ping", f"{target}:{target_port}"],
+        check=False, capture=True,
+    )
+    if (result.returncode != 0 or "Handshake succeeded" not in result.stdout
+            or "TLS 1.3" not in result.stdout):
+        detail = "\n".join(result.stdout.splitlines()[-8:])
+        raise InstallError(
+            f"Reality 目标必须通过 TLS 握手并支持 TLS 1.3：{target}:{target_port}"
+            + (f"\n{detail}" if detail else "")
+        )
+    print("Reality 目标 TLS 检查：通过")
+    return target, target_port
+
+
 def openrc_service(name: str, config: Path) -> str:
     return f'''#!/sbin/openrc-run
 name="{name}"
-description="Xray HY2 managed by xray-nat-node-manager"
+description="Xray node managed by xray-nat-node-manager"
 command="{XRAY_BINARY}"
 command_args="run -c {config}"
 command_background="yes"
@@ -614,7 +740,7 @@ depend() {{ need net; after firewall; }}
 
 def systemd_service(name: str, config: Path) -> str:
     return f'''[Unit]
-Description=Xray HY2 managed by xray-nat-node-manager ({name})
+Description=Xray node managed by xray-nat-node-manager ({name})
 Wants=network-online.target
 After=network-online.target
 
@@ -806,7 +932,7 @@ def install_acme_client(system: dict[str, str], email: str) -> None:
 
 
 def certificate_reload_script(system: dict[str, str]) -> str:
-    names = [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]
+    names = [spec["name"] for spec in SERVICE_SPECS.values() if spec["uses_tls_cert"]] + ["xui-agent"]
     if system["init"] == "openrc":
         body = "\n".join(
             f'[ ! -x /etc/init.d/{name} ] || /sbin/rc-service {name} restart' for name in names
@@ -963,7 +1089,13 @@ def load_secrets() -> dict:
 
 def role_is_configured(state: dict, role: str) -> bool:
     ports = state.get("ports") or {}
-    return all(key in ports for key in (f"{role}_internal_udp", f"{role}_external_udp"))
+    internal_key, external_key = role_port_keys(role)
+    return all(key in ports for key in (internal_key, external_key))
+
+
+def role_port_keys(role: str) -> tuple[str, str]:
+    protocol = SERVICE_SPECS[role]["port_protocol"].lower()
+    return f"{role}_internal_{protocol}", f"{role}_external_{protocol}"
 
 
 def agent_is_configured(state: dict) -> bool:
@@ -978,20 +1110,30 @@ def configured_roles(state: dict) -> list[str]:
 def validate_component_ports(state: dict, *, role: str | None = None,
                              internal: int, external: int, protocol: str) -> None:
     ports = state.get("ports") or {}
-    if protocol == "udp":
-        for other in SERVICE_SPECS:
-            if other == role or not role_is_configured(state, other):
-                continue
-            if ports[f"{other}_internal_udp"] == internal:
-                raise InstallError(f"内部 UDP 端口已被 {SERVICE_SPECS[other]['name']} 使用：{internal}")
-            if ports[f"{other}_external_udp"] == external:
-                raise InstallError(f"外部 UDP 端口已被 {SERVICE_SPECS[other]['name']} 使用：{external}")
+    protocol = protocol.lower()
+    for other, spec in SERVICE_SPECS.items():
+        if other == role or spec["port_protocol"].lower() != protocol or not role_is_configured(state, other):
+            continue
+        other_internal, other_external = role_port_keys(other)
+        if ports[other_internal] == internal:
+            raise InstallError(
+                f"内部 {protocol.upper()} 端口已被 {spec['label']} 使用：{internal}"
+            )
+        if ports[other_external] == external:
+            raise InstallError(
+                f"外部 {protocol.upper()} 端口已被 {spec['label']} 使用：{external}"
+            )
     if protocol == "tcp":
+        if role != "agent" and agent_is_configured(state):
+            if ports["agent_internal_tcp"] == internal:
+                raise InstallError(f"内部 TCP 端口已被 Agent 使用：{internal}")
+            if ports["agent_external_tcp"] == external:
+                raise InstallError(f"外部 TCP 端口已被 Agent 使用：{external}")
         tls = state.get("tls") or {}
         if tls.get("internal_tcp") == internal:
-            raise InstallError(f"Agent 与 ACME 不能共用内部 TCP 端口：{internal}")
+            raise InstallError(f"该节点与 ACME 不能共用内部 TCP 端口：{internal}")
         if tls.get("external_tcp") == external:
-            raise InstallError(f"Agent 与 ACME 不能共用外部 TCP 端口：{external}")
+            raise InstallError(f"该节点与 ACME 不能共用外部 TCP 端口：{external}")
 
 
 def collect_base_answers() -> dict:
@@ -1020,7 +1162,7 @@ def show_base_summary(answers: dict) -> None:
 def setup_base() -> None:
     system = require_root_supported()
     if STATE.exists():
-        print("基础设置已经完成；初始化新的节点服务请选择 2，设置 Agent 请选择 5。")
+        print("基础设置已经完成；创建节点请选择 2，设置 Agent 请选择 5。")
         return
     check_linux_tcp_bbr()
     answers = collect_base_answers()
@@ -1051,7 +1193,7 @@ def setup_base() -> None:
         answers["xray_version"] = XRAY_VERSION
         answers["system"] = system
         json_write(STATE, state_without_secrets(answers))
-        print("基础设置完成。接下来请选择 2 初始化需要的节点服务，再选择 5 设置 Agent。")
+        print("基础设置完成。接下来请选择 2 创建需要的节点，再选择 5 设置 Agent。")
         show_mapping(answers)
     except Exception:
         print(f"基础设置失败，正在恢复：{backup}", file=sys.stderr)
@@ -1107,7 +1249,7 @@ def build_agent_config(state: dict, credentials: dict, system: dict[str, str]) -
         raise InstallError("尚未设置 Agent 端口")
     services = agent_services(state, system)
     if not services:
-        raise InstallError("请先选择 2 至少初始化一个节点服务，再设置 Agent")
+        raise InstallError("请先选择 2 至少创建一个节点，再设置 Agent")
     token, panel_guid = agent_credentials(credentials)
     return {
         "listen": f"0.0.0.0:{state['ports']['agent_internal_tcp']}",
@@ -1143,34 +1285,45 @@ def refresh_agent(system: dict[str, str], state: dict, credentials: dict) -> Non
     run(service_argv(system, "xui-agent", "status"))
 
 
-def initialize_node_service() -> None:
+def create_node() -> None:
     system = require_root_supported()
     state = load_state()
     credentials = load_secrets()
-    print("\n初始化节点服务：")
+    print("\n创建节点：")
     print(" 1. HY2 直连节点")
-    print(" 2. HY2 中转落地节点（供美国入口连接）")
+    print(" 2. HY2 中转落地节点（供中转接入）")
+    print(" 3. VLESS + Reality 节点")
     choice = prompt("请选择", "1")
-    role = {"1": "direct", "2": "relay"}.get(choice)
+    role = {"1": "direct", "2": "relay", "3": "reality"}.get(choice)
     if role is None:
         raise InstallError("无效的节点类型")
-    label = "HY2 直连" if role == "direct" else "HY2 中转落地"
+    spec = SERVICE_SPECS[role]
+    label = spec["label"]
     if role_is_configured(state, role):
-        print(f"{label} 服务已经初始化。后续入站和客户端请在美国总 3x-ui 面板调整。")
+        print(f"{label} 节点已经创建。后续入站和客户端请在 3x-ui 总面板调整。")
         print("公网外部端口映射仍需在 NAT 服务商后台管理。")
         return
+    if spec["protocol"] == "hy2" and any(
+            role_is_configured(state, other)
+            for other in ("direct", "relay") if other != role):
+        print("提示：两条 HY2 使用独立服务，内部 UDP 端口不能相同。")
     print(f"\n[{label}] 端口")
-    internal, external = collect_service_ports(label, "UDP", state["network"])
-    validate_component_ports(state, role=role, internal=internal, external=external, protocol="udp")
+    port_protocol = spec["port_protocol"]
+    internal, external = collect_service_ports(label, port_protocol, state["network"])
+    validate_component_ports(
+        state, role=role, internal=internal, external=external, protocol=port_protocol,
+    )
     if state["network"]["mode"] == "mapped":
-        print(f"  需要 NAT 映射：UDP {external} -> UDP {internal}")
+        print(f"  需要 NAT 映射：{port_protocol} {external} -> {port_protocol} {internal}")
     else:
-        print(f"  公网监听：UDP {internal}")
+        print(f"  公网监听：{port_protocol} {internal}")
+    reality_target = None
+    if spec["protocol"] == "reality":
+        reality_target = collect_reality_target()
     if not yes_no(f"确认设置 {label}", True):
         print("已取消，未修改节点")
         return
 
-    spec = SERVICE_SPECS[role]
     service_preexisted = service_file(system, spec["name"]).exists()
     managed = [spec["config"].parent, service_file(system, spec["name"]), STATE, SECRETS]
     rollback_services = [spec["name"]]
@@ -1180,13 +1333,29 @@ def initialize_node_service() -> None:
     backup = backup_paths(managed)
     print(f"备份：{backup}")
     try:
-        credentials.setdefault(f"{role}_auth", secrets.token_hex(24))
-        credentials.setdefault(f"{role}_obfs_password", secrets.token_hex(24))
-        config = hy2_config(
-            domain=state["domain"], port=internal, cert=state["cert"], key=state["key"],
-            auth=credentials[f"{role}_auth"],
-            obfs_password=credentials[f"{role}_obfs_password"], spec=spec,
-        )
+        if spec["protocol"] == "hy2":
+            credentials.setdefault(f"{role}_auth", secrets.token_hex(24))
+            credentials.setdefault(f"{role}_obfs_password", secrets.token_hex(24))
+            config = hy2_config(
+                domain=state["domain"], port=internal, cert=state["cert"], key=state["key"],
+                auth=credentials[f"{role}_auth"],
+                obfs_password=credentials[f"{role}_obfs_password"], spec=spec,
+            )
+        else:
+            if not credentials.get("reality_private_key") or not credentials.get("reality_public_key"):
+                private_key, public_key = generate_reality_key_pair()
+                credentials["reality_private_key"] = private_key
+                credentials["reality_public_key"] = public_key
+            credentials.setdefault("reality_client_id", str(uuid.uuid4()))
+            credentials.setdefault("reality_short_id", secrets.token_hex(8))
+            target, target_port = reality_target
+            state["reality"] = {"target": target, "target_port": target_port}
+            config = reality_config(
+                port=internal, target=target, target_port=target_port,
+                client_id=credentials["reality_client_id"],
+                private_key=credentials["reality_private_key"],
+                short_id=credentials["reality_short_id"], spec=spec,
+            )
         json_write(spec["config"], config)
         validate_xray([spec["config"]])
         write_atomic(
@@ -1198,17 +1367,18 @@ def initialize_node_service() -> None:
         run(service_enable_argv(system, spec["name"]), check=False)
         run(service_argv(system, spec["name"], "restart"))
         run(service_argv(system, spec["name"], "status"))
-        state["ports"][f"{role}_internal_udp"] = internal
-        state["ports"][f"{role}_external_udp"] = external
+        internal_key, external_key = role_port_keys(role)
+        state["ports"][internal_key] = internal
+        state["ports"][external_key] = external
         state["updated_at"] = stamp()
         json_write(SECRETS, credentials)
         json_write(STATE, state)
         if agent_is_configured(state):
             refresh_agent(system, state, credentials)
-        print(f"{label} 服务初始化完成。")
+        print(f"{label} 节点创建完成。")
         print("请选择 3. 查看节点连接，按需显示敏感链接。")
     except Exception:
-        print(f"节点服务初始化失败，正在恢复：{backup}", file=sys.stderr)
+        print(f"节点创建失败，正在恢复：{backup}", file=sys.stderr)
         if not service_preexisted:
             run(service_disable_argv(system, spec["name"]), check=False, capture=True)
         restore_backup(backup, system, rollback_services)
@@ -1219,13 +1389,15 @@ def configure_agent() -> None:
     system = require_root_supported()
     state = load_state()
     if not configured_roles(state):
-        raise InstallError("请先选择 2 至少初始化一个节点服务，再设置 Agent")
+        raise InstallError("请先选择 2 至少创建一个节点，再设置 Agent")
     credentials = load_secrets()
     if agent_is_configured(state) and not yes_no("Agent 已存在，是否修改端口并保留现有 Token", False):
         return
     print("\n[Agent] 管理端口")
     internal, external = collect_service_ports("Agent 管理", "TCP", state["network"])
-    validate_component_ports(state, internal=internal, external=external, protocol="tcp")
+    validate_component_ports(
+        state, role="agent", internal=internal, external=external, protocol="tcp",
+    )
     if state["network"]["mode"] == "mapped":
         print(f"  需要 NAT 映射：TCP {external} -> TCP {internal}")
     else:
@@ -1272,10 +1444,13 @@ def show_mapping(state: dict | None = None) -> None:
     ports = state.get("ports") or {}
     mapped = (state.get("network") or {}).get("mode", "mapped") == "mapped"
     components = []
-    for role, label in (("direct", "HY2 直连"), ("relay", "HY2 美国中转落地")):
+    for role, spec in SERVICE_SPECS.items():
         if not role_is_configured(state, role):
             continue
-        components.append(("UDP", ports[f"{role}_internal_udp"], ports[f"{role}_external_udp"], label))
+        internal_key, external_key = role_port_keys(role)
+        components.append((
+            spec["port_protocol"], ports[internal_key], ports[external_key], spec["label"],
+        ))
     if agent_is_configured(state):
         components.append(("TCP", ports["agent_internal_tcp"], ports["agent_external_tcp"], "xui-agent"))
     if components and mapped:
@@ -1286,7 +1461,7 @@ def show_mapping(state: dict | None = None) -> None:
         else:
             print(f"  {protocol} {internal}  ({label}，内外相同)")
     if not components:
-        print("  尚未初始化节点服务或设置 Agent 端口。")
+        print("  尚未创建节点或设置 Agent 端口。")
     tls = state.get("tls") or {}
     if tls.get("external_tcp"):
         if mapped:
@@ -1317,13 +1492,38 @@ def hy2_uri(role: str) -> str:
     if not role_is_configured(state, role):
         raise InstallError("该节点尚未设置")
     credentials = load_secrets()
-    external = state["ports"][f"{role}_external_udp"]
+    _, external_key = role_port_keys(role)
+    external = state["ports"][external_key]
     query = urllib.parse.urlencode({
         "sni": state["domain"], "insecure": "0", "alpn": "h3", "obfs": "salamander",
         "obfs-password": credentials[f"{role}_obfs_password"],
     })
     auth = urllib.parse.quote(credentials[f"{role}_auth"], safe="")
     return f"hysteria2://{auth}@{uri_host(state['domain'])}:{external}/?{query}"
+
+
+def reality_uri() -> str:
+    state = load_state()
+    if not role_is_configured(state, "reality"):
+        raise InstallError("VLESS + Reality 节点尚未创建")
+    credentials = load_secrets()
+    _, external_key = role_port_keys("reality")
+    target = state["reality"]["target"]
+    query = urllib.parse.urlencode({
+        "encryption": "none",
+        "flow": "xtls-rprx-vision",
+        "security": "reality",
+        "sni": target,
+        "fp": "chrome",
+        "pbk": credentials["reality_public_key"],
+        "sid": credentials["reality_short_id"],
+        "type": "tcp",
+        "spx": "/",
+    })
+    return (
+        f"vless://{credentials['reality_client_id']}@{uri_host(state['domain'])}:"
+        f"{state['ports'][external_key]}?{query}#VLESS-Reality"
+    )
 
 
 def status() -> None:
@@ -1333,7 +1533,7 @@ def status() -> None:
     if agent_is_configured(state):
         names.append("xui-agent")
     if not names:
-        print("尚未初始化节点服务或设置 Agent。")
+        print("尚未创建节点或设置 Agent。")
     for name in names:
         result = run(service_argv(system, name, "status"), check=False, capture=True)
         print(f"{name}: {'started' if result.returncode == 0 else 'stopped/error'}")
@@ -1348,11 +1548,13 @@ def print_links() -> None:
     state = load_state()
     roles = configured_roles(state)
     if not roles:
-        raise InstallError("尚未初始化节点服务；请选择 2. 初始化节点服务")
+        raise InstallError("尚未创建节点；请选择 2. 创建节点")
     if "direct" in roles:
-        print("直连：", hy2_uri("direct"))
+        print("HY2 直连：", hy2_uri("direct"))
     if "relay" in roles:
-        print("中转落地（提供给美国出站）：", hy2_uri("relay"))
+        print("HY2 中转落地（供中转接入）：", hy2_uri("relay"))
+    if "reality" in roles:
+        print("VLESS + Reality：", reality_uri())
 
 
 def print_agent_setup() -> None:
@@ -1369,7 +1571,7 @@ def show_status_and_mapping() -> None:
 def menu() -> None:
     actions = {
         "1": ("基础设置（首次使用）", setup_base),
-        "2": ("初始化节点服务", initialize_node_service),
+        "2": ("创建节点", create_node),
         "3": ("查看节点连接（包含敏感凭据）", print_links),
         "4": ("查看服务状态/端口映射", show_status_and_mapping),
         "5": ("设置 Agent", configure_agent),
