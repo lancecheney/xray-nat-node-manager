@@ -25,6 +25,17 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("Linux TCP BBR：已开启", output.getvalue())
         self.assertIn("HY2 使用独立的 QUIC BBR", output.getvalue())
 
+    def test_bbr_missing_qdisc_is_described_as_host_not_exposed(self):
+        status = {
+            "congestion_control": "bbr",
+            "available": "reno cubic bbr",
+            "default_qdisc": None,
+        }
+        output = io.StringIO()
+        with mock.patch.object(nm, "linux_tcp_bbr_status", return_value=status), redirect_stdout(output):
+            nm.check_linux_tcp_bbr()
+        self.assertIn("宿主机未暴露（NAT/LXC 常见）", output.getvalue())
+
     def test_bbr_disabled_can_be_skipped_and_install_continues(self):
         output = io.StringIO()
         status = {
@@ -89,40 +100,36 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.read_text(), "old-setting=1\n")
             restore.assert_called_once_with(before)
 
-    def test_install_questions_are_grouped_and_tls_precedes_ports(self):
-        answers = iter([
-            "1", "node.example.com", "1", "3", "/cert.pem", "/key.pem",
-            "5201", "45066", "24443", "58350", "5201", "45066",
-        ])
+    def test_base_setup_stops_before_node_and_agent_ports(self):
+        answers = iter(["1", "node.example.com", "1", "3", "/cert.pem", "/key.pem"])
         output = io.StringIO()
         with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
                 mock.patch.object(nm, "detect_public_ip", return_value=None), \
                 mock.patch.object(nm, "validate_cert_paths") as validate, redirect_stdout(output):
-            result = nm.collect_install_answers()
+            result = nm.collect_base_answers()
 
         validate.assert_called_once_with("/cert.pem", "/key.pem", "node.example.com")
         rendered = output.getvalue()
-        headings = ["[1/6] 节点地址", "[2/6] 端口方式", "[3/6] TLS 证书", "[4/6] HY2 直连端口", "[5/6] HY2 中转落地端口", "[6/6] Agent 管理端口"]
+        headings = ["[1/3] 节点地址", "[2/3] 端口方式", "[3/3] TLS 证书"]
         positions = [rendered.index(heading) for heading in headings]
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(result["ports"]["relay_external_udp"], 58350)
+        self.assertNotIn("HY2 直连端口", rendered)
+        self.assertNotIn("Agent 管理端口", rendered)
+        self.assertEqual(result["ports"], {})
         self.assertEqual(result["network"]["mode"], "mapped")
 
-    def test_direct_mode_uses_one_required_port_for_each_service(self):
-        answers = iter([
-            "1", "node.example.com", "2", "3", "/cert.pem", "/key.pem",
-            "12001", "12002", "12003",
-        ])
-        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
-                mock.patch.object(nm, "detect_public_ip", return_value=None), \
-                mock.patch.object(nm, "validate_cert_paths"):
-            result = nm.collect_install_answers()
-
-        self.assertEqual(result["network"]["mode"], "direct")
-        self.assertEqual(result["ports"]["direct_internal_udp"], 12001)
-        self.assertEqual(result["ports"]["direct_external_udp"], 12001)
-        self.assertEqual(result["ports"]["agent_internal_tcp"], 12003)
-        self.assertEqual(result["ports"]["agent_external_tcp"], 12003)
+    def test_each_component_collects_only_its_own_ports(self):
+        mapped_answers = iter(["12001", "22001"])
+        with mock.patch("builtins.input", side_effect=lambda _: next(mapped_answers)):
+            self.assertEqual(
+                nm.collect_service_ports("HY2 直连", "UDP", {"mode": "mapped"}),
+                (12001, 22001),
+            )
+        with mock.patch("builtins.input", return_value="12002"):
+            self.assertEqual(
+                nm.collect_service_ports("HY2 中转落地", "UDP", {"mode": "direct"}),
+                (12002, 12002),
+            )
 
     def test_node_address_explicitly_selects_domain_or_detected_ip(self):
         domain_answers = iter(["1", "Node.Example.com"])
@@ -135,7 +142,7 @@ class ConfigTests(unittest.TestCase):
                 mock.patch.object(nm, "detect_public_ip", return_value="69.42.222.160"):
             self.assertEqual(nm.collect_node_identity(), "69.42.222.160")
 
-    def test_summary_can_edit_one_port_section_without_restarting(self):
+    def test_old_flat_state_is_compatible_with_modular_components(self):
         state = {
             "domain": "node.example.com",
             "network": {"mode": "mapped"},
@@ -150,12 +157,41 @@ class ConfigTests(unittest.TestCase):
                 "agent_external_tcp": 20003,
             },
         }
-        answers = iter(["2", "11001", "21001", "1"])
-        with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
-            self.assertTrue(nm.review_install_answers(state))
-        self.assertEqual(state["ports"]["direct_internal_udp"], 11001)
-        self.assertEqual(state["ports"]["direct_external_udp"], 21001)
-        self.assertEqual(state["ports"]["relay_internal_udp"], 10002)
+        self.assertEqual(nm.configured_roles(state), ["direct", "relay"])
+        self.assertTrue(nm.agent_is_configured(state))
+
+    def test_node_port_validation_only_compares_configured_peer(self):
+        state = {
+            "ports": {
+                "direct_internal_udp": 10001,
+                "direct_external_udp": 20001,
+            },
+            "tls": {},
+        }
+        nm.validate_component_ports(
+            state, role="relay", internal=10002, external=20002, protocol="udp",
+        )
+        with self.assertRaisesRegex(nm.InstallError, "内部 UDP 端口"):
+            nm.validate_component_ports(
+                state, role="relay", internal=10001, external=20002, protocol="udp",
+            )
+
+    def test_mapping_renders_only_configured_components(self):
+        state = {
+            "network": {"mode": "mapped"},
+            "tls": {},
+            "ports": {
+                "direct_internal_udp": 10001,
+                "direct_external_udp": 20001,
+            },
+        }
+        output = io.StringIO()
+        with redirect_stdout(output):
+            nm.show_mapping(state)
+        rendered = output.getvalue()
+        self.assertIn("UDP 20001 -> UDP 10001", rendered)
+        self.assertNotIn("HY2 美国中转落地", rendered)
+        self.assertNotIn("xui-agent", rendered)
 
     def test_http_validation_has_fixed_public_port_and_configurable_nat_port(self):
         answers = iter(["2", "18080", "y", "admin@example.com"])
@@ -196,7 +232,7 @@ class ConfigTests(unittest.TestCase):
         output = io.StringIO()
         state = {
             "domain": "node.example.com",
-            "ports": {"agent_external_tcp": 45066},
+            "ports": {"agent_internal_tcp": 5201, "agent_external_tcp": 45066},
         }
         with redirect_stdout(output):
             nm.show_agent_setup(state)
@@ -206,6 +242,28 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("协议：https", rendered)
         self.assertIn("标准验证（verify", rendered)
         self.assertIn("基础路径：/", rendered)
+
+    def test_agent_services_include_only_configured_nodes(self):
+        state = {
+            "ports": {
+                "relay_internal_udp": 10002,
+                "relay_external_udp": 20002,
+            },
+        }
+        services = nm.agent_services(state, {"init": "openrc"})
+        self.assertEqual([service["name"] for service in services], ["xray-hy2-relay"])
+        self.assertTrue(services[0]["default"])
+
+    def test_menu_exposes_modular_setup_actions(self):
+        output = io.StringIO()
+        with mock.patch("builtins.input", return_value="0"), redirect_stdout(output):
+            nm.menu()
+        rendered = output.getvalue()
+        self.assertIn("1. 全新设置", rendered)
+        self.assertIn("2. 设置节点", rendered)
+        self.assertIn("3. 查看节点连接", rendered)
+        self.assertIn("5. 设置 Agent", rendered)
+        self.assertIn("6. 查看 Agent 接入信息", rendered)
 
     def test_acme_modes_match_identity_type(self):
         cloudflare = nm.acme_validation_args("node.example.com", {"method": "cloudflare"})
@@ -281,6 +339,15 @@ class ConfigTests(unittest.TestCase):
         self.assertIn('command_args="run -c /etc/test.json"', openrc)
         self.assertIn("[Service]", systemd)
         self.assertIn("ExecStart=/usr/local/bin/xray run -c /etc/test.json", systemd)
+        with mock.patch.object(nm.shutil, "which", return_value=None):
+            self.assertEqual(
+                nm.service_disable_argv(alpine, "xray-hy2-direct"),
+                ["/sbin/rc-update", "del", "xray-hy2-direct", "default"],
+            )
+            self.assertEqual(
+                nm.service_disable_argv(debian, "xray-hy2-direct"),
+                ["/bin/systemctl", "disable", "xray-hy2-direct"],
+            )
 
     def test_atomic_write_replaces_complete_file(self):
         with tempfile.TemporaryDirectory() as directory:

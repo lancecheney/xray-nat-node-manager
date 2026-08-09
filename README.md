@@ -25,9 +25,21 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh)
 ```
 
-脚本会下载完整安装包、安装必要依赖并自动进入 `node-manager` 交互菜单。选择 `1. 全新安装/重装` 后，程序会先明确选择“使用域名 / 检测 IP / 手动 IP”，域名为推荐默认项；随后选择“端口映射”或“无端口映射”。HY2 与 Agent 的业务端口都必须手动填写；NAT 映射模式分别填写内部监听端口和外部公网端口，无映射模式只填写一个端口。最终汇总页可以单独修改直连、中转或 Agent 端口，不需要全部重填。
+脚本会下载完整安装包、安装必要依赖并自动进入模块化菜单：
 
-在节点地址问题之前，程序会显示 `[0/6] Linux TCP BBR`。判断以 `net.ipv4.tcp_congestion_control` 的实时值为准，不使用可能漏报内核内置功能的 `lsmod | grep bbr`。如果 NAT/LXC 无权修改宿主内核，程序会恢复原配置、说明原因并继续安装。Linux TCP BBR 只影响 TCP；HY2 使用的是 Xray 内部独立配置的 QUIC BBR `standard`。
+```text
+1. 全新设置（基础环境、域名和证书）
+2. 设置节点
+3. 查看节点连接（包含敏感凭据）
+4. 查看服务状态/端口映射
+5. 设置 Agent
+6. 查看 Agent 接入信息（包含敏感凭据）
+0. 退出
+```
+
+首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写两条 HY2 与 Agent 端口。随后选择 `2`，单独创建或修改“HY2 直连”或“HY2 中转落地”；选择 `5` 再单独设置 Agent。修改一条节点会保留另一条节点及现有认证，Agent 已安装时会自动收录当前节点。
+
+在节点地址问题之前，程序会显示 `[0/3] Linux TCP BBR`。判断以 `net.ipv4.tcp_congestion_control` 的实时值为准，不使用可能漏报内核内置功能的 `lsmod | grep bbr`。如果 NAT/LXC 无权修改宿主内核，程序会恢复原配置、说明原因并继续安装。Linux TCP BBR 只影响 TCP；HY2 使用的是 Xray 内部独立配置的 QUIC BBR `standard`。
 
 ## TLS 与自动续期
 

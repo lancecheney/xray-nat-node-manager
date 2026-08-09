@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.7"
+VERSION = "0.4.0"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -171,7 +171,7 @@ def detect_public_ip() -> str | None:
 
 
 def collect_node_identity() -> str:
-    print("\n[1/6] 节点地址")
+    print("\n[1/3] 节点地址")
     detected_ip = detect_public_ip()
     if detected_ip:
         print(f"检测到公网出口 IP：{detected_ip}")
@@ -210,7 +210,7 @@ def certificate_method_label(method: str) -> str:
 
 
 def collect_network_answers() -> dict:
-    print("\n[2/6] 端口方式")
+    print("\n[2/3] 端口方式")
     print(" 1. 端口映射（NAT：分别设置内部端口和外部端口）")
     print(" 2. 无端口映射（公网机：监听端口就是公网端口）")
     choice = prompt("请选择", "1")
@@ -229,7 +229,7 @@ def collect_service_ports(label: str, protocol: str, network: dict) -> tuple[int
 
 
 def collect_tls_answers(identity: str, network: dict) -> dict:
-    print("\n[3/6] TLS 证书")
+    print("\n[3/3] TLS 证书")
     if is_ip_identity(identity):
         print(" 1. HTTP-01 自动申请（公网 TCP 80）")
         print(" 2. TLS-ALPN-01 自动申请（公网 TCP 443）")
@@ -314,6 +314,10 @@ def linux_tcp_bbr_enabled(status: dict[str, str | None]) -> bool:
     return status["congestion_control"] == "bbr"
 
 
+def qdisc_display(status: dict[str, str | None]) -> str:
+    return status.get("default_qdisc") or "宿主机未暴露（NAT/LXC 常见）"
+
+
 def restore_bbr_runtime(status: dict[str, str | None]) -> None:
     for name, key in (
         ("net.core.default_qdisc", "default_qdisc"),
@@ -359,10 +363,10 @@ def enable_linux_tcp_bbr(config_path: Path = BBR_SYSCTL_CONFIG) -> dict[str, str
 
 
 def check_linux_tcp_bbr() -> None:
-    print("\n[0/6] Linux TCP BBR")
+    print("\n[0/3] Linux TCP BBR")
     status = linux_tcp_bbr_status()
     if linux_tcp_bbr_enabled(status):
-        print(f"Linux TCP BBR：已开启（default_qdisc={status['default_qdisc'] or 'unknown'}）")
+        print(f"Linux TCP BBR：已开启（default_qdisc={qdisc_display(status)}）")
         print("提示：这是 TCP BBR；HY2 使用独立的 QUIC BBR。")
         return
     current = status["congestion_control"] or "unknown"
@@ -376,7 +380,7 @@ def check_linux_tcp_bbr() -> None:
         print(f"Linux TCP BBR 开启失败：{exc}")
         print("已恢复原设置并继续安装；这不影响 HY2 的 QUIC BBR。")
         return
-    print(f"Linux TCP BBR：已开启（default_qdisc={enabled['default_qdisc'] or 'unknown'}）")
+    print(f"Linux TCP BBR：已开启（default_qdisc={qdisc_display(enabled)}）")
     print("配置已保存到 /etc/sysctl.d/99-xray-nat-node-manager-bbr.conf")
     print("提示：这是 TCP BBR；HY2 使用独立的 QUIC BBR。")
 
@@ -632,6 +636,12 @@ def service_enable_argv(system: dict[str, str], name: str) -> list[str]:
     return [shutil.which("systemctl") or "/bin/systemctl", "enable", name]
 
 
+def service_disable_argv(system: dict[str, str], name: str) -> list[str]:
+    if system["init"] == "openrc":
+        return [shutil.which("rc-update") or "/sbin/rc-update", "del", name, "default"]
+    return [shutil.which("systemctl") or "/bin/systemctl", "disable", name]
+
+
 def service_daemon_reload(system: dict[str, str]) -> None:
     if system["init"] == "systemd":
         run([shutil.which("systemctl") or "/bin/systemctl", "daemon-reload"])
@@ -816,9 +826,12 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def restore_backup(target: Path, system: dict[str, str]) -> None:
+def restore_backup(target: Path, system: dict[str, str], services: list[str] | None = None) -> None:
     manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
-    for name in [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]:
+    service_names = services if services is not None else [
+        spec["name"] for spec in SERVICE_SPECS.values()
+    ] + ["xui-agent"]
+    for name in service_names:
         run(service_argv(system, name, "stop"), check=False, capture=True)
     for record in manifest:
         path = Path(record["path"])
@@ -832,7 +845,7 @@ def restore_backup(target: Path, system: dict[str, str]) -> None:
         else:
             shutil.copy2(source, path)
     service_daemon_reload(system)
-    for name in [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]:
+    for name in service_names:
         if service_file(system, name).exists():
             run(service_argv(system, name, "start"), check=False, capture=True)
 
@@ -844,136 +857,96 @@ def validate_xray(configs: list[Path]) -> None:
             raise InstallError(f"Xray 拒绝配置 {config}:\n{result.stdout}")
 
 
-def check_port_conflicts(ports: list[tuple[int, str]]) -> None:
-    seen = set()
-    for port, protocol in ports:
-        key = (port, protocol)
-        if key in seen:
-            raise InstallError(f"重复监听：{protocol}/{port}")
-        seen.add(key)
+def load_state() -> dict:
+    if not STATE.is_file():
+        raise InstallError("尚未完成基础设置；请先选择 1. 全新设置")
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    state.setdefault("ports", {})
+    return state
 
 
-def validate_install_ports(answers: dict) -> None:
-    ports = answers["ports"]
-    tls = answers["tls"]
-    check_port_conflicts([
-        (ports["direct_internal_udp"], "udp"),
-        (ports["relay_internal_udp"], "udp"),
-        (ports["agent_internal_tcp"], "tcp"),
-    ])
-    check_port_conflicts([
-        (ports["direct_external_udp"], "udp"),
-        (ports["relay_external_udp"], "udp"),
-        (ports["agent_external_tcp"], "tcp"),
-    ])
-    if tls.get("internal_tcp") == ports["agent_internal_tcp"]:
-        raise InstallError(f"ACME 与 Agent 不能共用内部 TCP 端口：{ports['agent_internal_tcp']}")
-    if tls.get("external_tcp") == ports["agent_external_tcp"]:
-        raise InstallError(f"ACME 与 Agent 不能共用外部 TCP 端口：{ports['agent_external_tcp']}")
+def load_secrets() -> dict:
+    if not SECRETS.is_file():
+        return {}
+    return json.loads(SECRETS.read_text(encoding="utf-8"))
 
 
-def collect_install_answers() -> dict:
+def role_is_configured(state: dict, role: str) -> bool:
+    ports = state.get("ports") or {}
+    return all(key in ports for key in (f"{role}_internal_udp", f"{role}_external_udp"))
+
+
+def agent_is_configured(state: dict) -> bool:
+    ports = state.get("ports") or {}
+    return all(key in ports for key in ("agent_internal_tcp", "agent_external_tcp"))
+
+
+def configured_roles(state: dict) -> list[str]:
+    return [role for role in SERVICE_SPECS if role_is_configured(state, role)]
+
+
+def validate_component_ports(state: dict, *, role: str | None = None,
+                             internal: int, external: int, protocol: str) -> None:
+    ports = state.get("ports") or {}
+    if protocol == "udp":
+        for other in SERVICE_SPECS:
+            if other == role or not role_is_configured(state, other):
+                continue
+            if ports[f"{other}_internal_udp"] == internal:
+                raise InstallError(f"内部 UDP 端口已被 {SERVICE_SPECS[other]['name']} 使用：{internal}")
+            if ports[f"{other}_external_udp"] == external:
+                raise InstallError(f"外部 UDP 端口已被 {SERVICE_SPECS[other]['name']} 使用：{external}")
+    if protocol == "tcp":
+        tls = state.get("tls") or {}
+        if tls.get("internal_tcp") == internal:
+            raise InstallError(f"Agent 与 ACME 不能共用内部 TCP 端口：{internal}")
+        if tls.get("external_tcp") == external:
+            raise InstallError(f"Agent 与 ACME 不能共用外部 TCP 端口：{external}")
+
+
+def collect_base_answers() -> dict:
     domain = collect_node_identity()
     network = collect_network_answers()
     tls = collect_tls_answers(domain, network)
-
-    print("\n[4/6] HY2 直连端口")
-    direct_internal, direct_external = collect_service_ports("HY2 直连", "UDP", network)
-
-    print("\n[5/6] HY2 中转落地端口")
-    relay_internal, relay_external = collect_service_ports("HY2 中转落地", "UDP", network)
-
-    print("\n[6/6] Agent 管理端口")
-    agent_internal, agent_external = collect_service_ports("Agent 管理", "TCP", network)
-    answers = {
+    return {
         "domain": domain,
         "network": network,
         "tls": tls,
         "cert": tls.get("cert"),
         "key": tls.get("key"),
-        "ports": {
-            "direct_internal_udp": direct_internal,
-            "direct_external_udp": direct_external,
-            "relay_internal_udp": relay_internal,
-            "relay_external_udp": relay_external,
-            "agent_internal_tcp": agent_internal,
-            "agent_external_tcp": agent_external,
-        },
+        "ports": {},
     }
-    validate_install_ports(answers)
-    return answers
 
 
-def show_install_summary(answers: dict) -> None:
-    print("\n即将安装：")
+def show_base_summary(answers: dict) -> None:
+    print("\n即将完成基础设置：")
     print(f"  节点身份：{answers['domain']}")
+    print(f"  端口方式：{'端口映射（NAT）' if answers['network']['mode'] == 'mapped' else '无端口映射（公网机）'}")
     print(f"  TLS 证书：{certificate_method_label(answers['tls']['method'])}")
-    if answers["cert"]:
+    if answers.get("cert"):
         print(f"  证书路径：{answers['cert']}")
-    show_mapping(answers)
 
 
-def review_install_answers(answers: dict) -> bool:
-    while True:
-        show_install_summary(answers)
-        print("\n 1. 确认并开始安装")
-        print(" 2. 修改 HY2 直连端口")
-        print(" 3. 修改 HY2 中转端口")
-        print(" 4. 修改 Agent 管理端口")
-        print(" 0. 取消")
-        choice = prompt("请选择", "1")
-        if choice == "1":
-            return True
-        if choice == "0":
-            return False
-        old_ports = answers["ports"].copy()
-        if choice == "2":
-            internal, external = collect_service_ports("HY2 直连", "UDP", answers["network"])
-            answers["ports"]["direct_internal_udp"] = internal
-            answers["ports"]["direct_external_udp"] = external
-        elif choice == "3":
-            internal, external = collect_service_ports("HY2 中转落地", "UDP", answers["network"])
-            answers["ports"]["relay_internal_udp"] = internal
-            answers["ports"]["relay_external_udp"] = external
-        elif choice == "4":
-            internal, external = collect_service_ports("Agent 管理", "TCP", answers["network"])
-            answers["ports"]["agent_internal_tcp"] = internal
-            answers["ports"]["agent_external_tcp"] = external
-        else:
-            print("无效选择")
-            continue
-        try:
-            validate_install_ports(answers)
-        except InstallError as exc:
-            answers["ports"] = old_ports
-            print(f"端口修改无效：{exc}")
-
-
-def install_all() -> None:
+def setup_base() -> None:
     system = require_root_supported()
-    check_linux_tcp_bbr()
-    if STATE.exists() and not yes_no("检测到已有安装，是否覆盖并先备份", False):
+    if STATE.exists():
+        print("基础设置已经完成；设置或修改线路请选择 2，设置 Agent 请选择 5。")
         return
-    answers = collect_install_answers()
-    if not review_install_answers(answers):
+    check_linux_tcp_bbr()
+    answers = collect_base_answers()
+    show_base_summary(answers)
+    if not yes_no("确认保存基础设置", True):
         print("已取消，未修改系统")
         return
-    packaged_agent = Path(__file__).resolve().parent / "assets" / xray_asset_for_agent()
-    if not packaged_agent.is_file():
-        raise InstallError(f"安装包缺少 Agent：{packaged_agent}")
 
     managed = [
-        ROOT, AGENT_CONFIG.parent, AGENT_STATE.parent, XRAY_BINARY, AGENT_BINARY,
-        service_file(system, "xui-agent"), ACME_RELOAD,
+        ROOT, XRAY_BINARY, ACME_RELOAD,
         Path("/etc/crontabs/root"), Path("/var/spool/cron/crontabs/root"),
     ]
     if answers["tls"]["method"] != "existing":
         managed += [ACME_HOME, ACME_CONFIG_HOME, ACME_CERT_HOME]
-    for spec in SERVICE_SPECS.values():
-        managed += [spec["config"].parent, service_file(system, spec["name"])]
     backup = backup_paths(managed)
     print(f"备份：{backup}")
-
     candidate_fd, candidate_name = tempfile.mkstemp(prefix="xray-", dir="/tmp")
     os.close(candidate_fd)
     candidate_xray = Path(candidate_name)
@@ -982,74 +955,17 @@ def install_all() -> None:
             answers["cert"], answers["key"] = issue_certificate(system, answers["domain"], answers["tls"])
         download_xray(XRAY_VERSION, candidate_xray)
         copy_atomic(candidate_xray, XRAY_BINARY, 0o755)
-
-        credentials = {
-            "agent_token": secrets.token_hex(32),
-            "direct_auth": secrets.token_hex(24),
-            "direct_obfs_password": secrets.token_hex(24),
-            "relay_auth": secrets.token_hex(24),
-            "relay_obfs_password": secrets.token_hex(24),
-        }
-        configs = []
-        for role, spec in SERVICE_SPECS.items():
-            port = answers["ports"][f"{role}_internal_udp"]
-            config = hy2_config(
-                domain=answers["domain"], port=port, cert=answers["cert"], key=answers["key"],
-                auth=credentials[f"{role}_auth"], obfs_password=credentials[f"{role}_obfs_password"], spec=spec,
-            )
-            json_write(spec["config"], config)
-            write_atomic(service_file(system, spec["name"]), service_definition(system, spec["name"], spec["config"]), 0o755 if system["init"] == "openrc" else 0o644)
-            configs.append(spec["config"])
-        validate_xray(configs)
-
-        copy_atomic(packaged_agent, AGENT_BINARY, 0o755)
-        services = []
-        for role, spec in SERVICE_SPECS.items():
-            services.append({
-                "name": spec["name"], "binary": str(XRAY_BINARY), "configPath": str(spec["config"]),
-                "apiEndpoint": f"127.0.0.1:{spec['api_port']}",
-                "restartCommand": service_argv(system, spec["name"], "restart"),
-                "statusCommand": service_argv(system, spec["name"], "status"),
-                "ignoreTags": ["api"], "default": role == "direct",
-            })
-        agent = {
-            "listen": f"0.0.0.0:{answers['ports']['agent_internal_tcp']}",
-            "token": credentials["agent_token"],
-            "panelGuid": secrets.token_hex(16),
-            "statePath": str(AGENT_STATE),
-            "tlsCertFile": answers["cert"],
-            "tlsKeyFile": answers["key"],
-            "services": services,
-        }
-        json_write(AGENT_CONFIG, agent)
-        write_atomic(service_file(system, "xui-agent"), service_definition(system, "xui-agent"), 0o755 if system["init"] == "openrc" else 0o644)
-        service_daemon_reload(system)
-        AGENT_STATE.parent.mkdir(parents=True, exist_ok=True)
-        run([str(AGENT_BINARY), "-config", str(AGENT_CONFIG), "-adopt"])
-        run([str(AGENT_BINARY), "-config", str(AGENT_CONFIG), "-check"])
-
-        for spec in SERVICE_SPECS.values():
-            run(service_enable_argv(system, spec["name"]), check=False)
-            run(service_argv(system, spec["name"], "restart"))
-            run(service_argv(system, spec["name"], "status"))
-        run(service_enable_argv(system, "xui-agent"), check=False)
-        run(service_argv(system, "xui-agent", "restart"))
-        run(service_argv(system, "xui-agent", "status"))
-
         ROOT.mkdir(parents=True, exist_ok=True)
-        json_write(SECRETS, credentials)
+        json_write(SECRETS, {})
         answers["installed_at"] = stamp()
         answers["xray_version"] = XRAY_VERSION
         answers["system"] = system
-        answers["agent_sha256"] = sha256(packaged_agent)
         json_write(STATE, state_without_secrets(answers))
-        print("安装完成。端口配置：")
+        print("基础设置完成。接下来请选择 2 设置需要的节点，或选择 5 设置 Agent。")
         show_mapping(answers)
-        show_agent_setup(answers)
-        print(f"敏感凭据只保存在：{SECRETS}")
     except Exception:
-        print(f"安装失败，正在恢复：{backup}", file=sys.stderr)
-        restore_backup(backup, system)
+        print(f"基础设置失败，正在恢复：{backup}", file=sys.stderr)
+        restore_backup(backup, system, [])
         raise
     finally:
         candidate_xray.unlink(missing_ok=True)
@@ -1064,19 +980,221 @@ def xray_asset_for_agent() -> str:
     raise InstallError(f"Agent 不支持的 CPU 架构：{machine}")
 
 
-def show_mapping(state: dict | None = None) -> None:
-    state = state or json.loads(STATE.read_text(encoding="utf-8"))
-    ports = state["ports"]
-    mapped = (state.get("network") or {}).get("mode", "mapped") == "mapped"
-    if mapped:
-        print("  请在 NAT 面板保留以下映射：")
-        print(f"  UDP {ports['direct_external_udp']} -> UDP {ports['direct_internal_udp']}  (HY2 直连)")
-        print(f"  UDP {ports['relay_external_udp']} -> UDP {ports['relay_internal_udp']}  (HY2 美国中转落地)")
-        print(f"  TCP {ports['agent_external_tcp']} -> TCP {ports['agent_internal_tcp']}  (xui-agent)")
+def agent_services(state: dict, system: dict[str, str]) -> list[dict]:
+    roles = configured_roles(state)
+    services = []
+    for index, role in enumerate(roles):
+        spec = SERVICE_SPECS[role]
+        services.append({
+            "name": spec["name"],
+            "binary": str(XRAY_BINARY),
+            "configPath": str(spec["config"]),
+            "apiEndpoint": f"127.0.0.1:{spec['api_port']}",
+            "restartCommand": service_argv(system, spec["name"], "restart"),
+            "statusCommand": service_argv(system, spec["name"], "status"),
+            "ignoreTags": ["api"],
+            "default": index == 0,
+        })
+    return services
+
+
+def agent_credentials(credentials: dict) -> tuple[str, str]:
+    existing = {}
+    if AGENT_CONFIG.is_file():
+        try:
+            existing = json.loads(AGENT_CONFIG.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = {}
+    token = credentials.get("agent_token") or existing.get("token") or secrets.token_hex(32)
+    panel_guid = credentials.get("agent_panel_guid") or existing.get("panelGuid") or secrets.token_hex(16)
+    credentials["agent_token"] = token
+    credentials["agent_panel_guid"] = panel_guid
+    return token, panel_guid
+
+
+def build_agent_config(state: dict, credentials: dict, system: dict[str, str]) -> dict:
+    if not agent_is_configured(state):
+        raise InstallError("尚未设置 Agent 端口")
+    services = agent_services(state, system)
+    if not services:
+        raise InstallError("请先选择 2 至少设置一个节点，再设置 Agent")
+    token, panel_guid = agent_credentials(credentials)
+    return {
+        "listen": f"0.0.0.0:{state['ports']['agent_internal_tcp']}",
+        "token": token,
+        "panelGuid": panel_guid,
+        "statePath": str(AGENT_STATE),
+        "tlsCertFile": state["cert"],
+        "tlsKeyFile": state["key"],
+        "services": services,
+    }
+
+
+def write_validated_agent_config(config: dict) -> None:
+    AGENT_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".xui-agent-candidate-", suffix=".json", dir=AGENT_CONFIG.parent)
+    os.close(fd)
+    candidate = Path(name)
+    try:
+        json_write(candidate, config)
+        run([str(AGENT_BINARY), "-config", str(candidate), "-check"])
+        os.replace(candidate, AGENT_CONFIG)
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
+def refresh_agent(system: dict[str, str], state: dict, credentials: dict) -> None:
+    config = build_agent_config(state, credentials, system)
+    write_validated_agent_config(config)
+    AGENT_STATE.parent.mkdir(parents=True, exist_ok=True)
+    run([str(AGENT_BINARY), "-config", str(AGENT_CONFIG), "-adopt"])
+    run([str(AGENT_BINARY), "-config", str(AGENT_CONFIG), "-check"])
+    run(service_argv(system, "xui-agent", "restart"))
+    run(service_argv(system, "xui-agent", "status"))
+
+
+def configure_node() -> None:
+    system = require_root_supported()
+    state = load_state()
+    credentials = load_secrets()
+    print("\n设置节点：")
+    print(" 1. HY2 直连节点")
+    print(" 2. HY2 中转落地节点（供美国入口连接）")
+    choice = prompt("请选择", "1")
+    role = {"1": "direct", "2": "relay"}.get(choice)
+    if role is None:
+        raise InstallError("无效的节点类型")
+    label = "HY2 直连" if role == "direct" else "HY2 中转落地"
+    if role_is_configured(state, role) and not yes_no(f"{label} 已存在，是否修改端口并保留现有认证", False):
+        return
+    print(f"\n[{label}] 端口")
+    internal, external = collect_service_ports(label, "UDP", state["network"])
+    validate_component_ports(state, role=role, internal=internal, external=external, protocol="udp")
+    if state["network"]["mode"] == "mapped":
+        print(f"  需要 NAT 映射：UDP {external} -> UDP {internal}")
     else:
-        print(f"  UDP {ports['direct_internal_udp']}  (HY2 直连，内外相同)")
-        print(f"  UDP {ports['relay_internal_udp']}  (HY2 美国中转落地，内外相同)")
-        print(f"  TCP {ports['agent_internal_tcp']}  (xui-agent，内外相同)")
+        print(f"  公网监听：UDP {internal}")
+    if not yes_no(f"确认设置 {label}", True):
+        print("已取消，未修改节点")
+        return
+
+    spec = SERVICE_SPECS[role]
+    service_preexisted = service_file(system, spec["name"]).exists()
+    managed = [spec["config"].parent, service_file(system, spec["name"]), STATE, SECRETS]
+    rollback_services = [spec["name"]]
+    if agent_is_configured(state):
+        managed += [AGENT_CONFIG, AGENT_STATE.parent]
+        rollback_services.append("xui-agent")
+    backup = backup_paths(managed)
+    print(f"备份：{backup}")
+    try:
+        credentials.setdefault(f"{role}_auth", secrets.token_hex(24))
+        credentials.setdefault(f"{role}_obfs_password", secrets.token_hex(24))
+        config = hy2_config(
+            domain=state["domain"], port=internal, cert=state["cert"], key=state["key"],
+            auth=credentials[f"{role}_auth"],
+            obfs_password=credentials[f"{role}_obfs_password"], spec=spec,
+        )
+        json_write(spec["config"], config)
+        validate_xray([spec["config"]])
+        write_atomic(
+            service_file(system, spec["name"]),
+            service_definition(system, spec["name"], spec["config"]),
+            0o755 if system["init"] == "openrc" else 0o644,
+        )
+        service_daemon_reload(system)
+        run(service_enable_argv(system, spec["name"]), check=False)
+        run(service_argv(system, spec["name"], "restart"))
+        run(service_argv(system, spec["name"], "status"))
+        state["ports"][f"{role}_internal_udp"] = internal
+        state["ports"][f"{role}_external_udp"] = external
+        state["updated_at"] = stamp()
+        json_write(SECRETS, credentials)
+        json_write(STATE, state)
+        if agent_is_configured(state):
+            refresh_agent(system, state, credentials)
+        print(f"{label} 设置完成。")
+        print("请选择 3. 查看节点连接，按需显示敏感链接。")
+    except Exception:
+        print(f"节点设置失败，正在恢复：{backup}", file=sys.stderr)
+        if not service_preexisted:
+            run(service_disable_argv(system, spec["name"]), check=False, capture=True)
+        restore_backup(backup, system, rollback_services)
+        raise
+
+
+def configure_agent() -> None:
+    system = require_root_supported()
+    state = load_state()
+    if not configured_roles(state):
+        raise InstallError("请先选择 2 至少设置一个节点，再设置 Agent")
+    credentials = load_secrets()
+    if agent_is_configured(state) and not yes_no("Agent 已存在，是否修改端口并保留现有 Token", False):
+        return
+    print("\n[Agent] 管理端口")
+    internal, external = collect_service_ports("Agent 管理", "TCP", state["network"])
+    validate_component_ports(state, internal=internal, external=external, protocol="tcp")
+    if state["network"]["mode"] == "mapped":
+        print(f"  需要 NAT 映射：TCP {external} -> TCP {internal}")
+    else:
+        print(f"  公网监听：TCP {internal}")
+    if not yes_no("确认设置 Agent", True):
+        print("已取消，未修改 Agent")
+        return
+
+    packaged_agent = Path(__file__).resolve().parent / "assets" / xray_asset_for_agent()
+    if not packaged_agent.is_file():
+        raise InstallError(f"安装包缺少 Agent：{packaged_agent}")
+    service_preexisted = service_file(system, "xui-agent").exists()
+    managed = [AGENT_CONFIG.parent, AGENT_STATE.parent, AGENT_BINARY,
+               service_file(system, "xui-agent"), STATE, SECRETS]
+    backup = backup_paths(managed)
+    print(f"备份：{backup}")
+    try:
+        state["ports"]["agent_internal_tcp"] = internal
+        state["ports"]["agent_external_tcp"] = external
+        copy_atomic(packaged_agent, AGENT_BINARY, 0o755)
+        write_atomic(
+            service_file(system, "xui-agent"), service_definition(system, "xui-agent"),
+            0o755 if system["init"] == "openrc" else 0o644,
+        )
+        service_daemon_reload(system)
+        run(service_enable_argv(system, "xui-agent"), check=False)
+        refresh_agent(system, state, credentials)
+        state["agent_sha256"] = sha256(packaged_agent)
+        state["updated_at"] = stamp()
+        json_write(SECRETS, credentials)
+        json_write(STATE, state)
+        print("Agent 设置完成。")
+        show_agent_setup(state)
+    except Exception:
+        print(f"Agent 设置失败，正在恢复：{backup}", file=sys.stderr)
+        if not service_preexisted:
+            run(service_disable_argv(system, "xui-agent"), check=False, capture=True)
+        restore_backup(backup, system, ["xui-agent"])
+        raise
+
+
+def show_mapping(state: dict | None = None) -> None:
+    state = state or load_state()
+    ports = state.get("ports") or {}
+    mapped = (state.get("network") or {}).get("mode", "mapped") == "mapped"
+    components = []
+    for role, label in (("direct", "HY2 直连"), ("relay", "HY2 美国中转落地")):
+        if not role_is_configured(state, role):
+            continue
+        components.append(("UDP", ports[f"{role}_internal_udp"], ports[f"{role}_external_udp"], label))
+    if agent_is_configured(state):
+        components.append(("TCP", ports["agent_internal_tcp"], ports["agent_external_tcp"], "xui-agent"))
+    if components and mapped:
+        print("  请在 NAT 面板保留以下映射：")
+    for protocol, internal, external, label in components:
+        if mapped:
+            print(f"  {protocol} {external} -> {protocol} {internal}  ({label})")
+        else:
+            print(f"  {protocol} {internal}  ({label}，内外相同)")
+    if not components:
+        print("  尚未设置节点或 Agent 端口。")
     tls = state.get("tls") or {}
     if tls.get("external_tcp"):
         if mapped:
@@ -1086,7 +1204,9 @@ def show_mapping(state: dict | None = None) -> None:
 
 
 def show_agent_setup(state: dict | None = None, *, include_token: bool = False) -> None:
-    state = state or json.loads(STATE.read_text(encoding="utf-8"))
+    state = state or load_state()
+    if not agent_is_configured(state):
+        raise InstallError("尚未设置 Agent；请选择 5. 设置 Agent")
     print("\n3x-ui Agent 设置：")
     print("  协议：https")
     print(f"  主机（不含 https://）：{state['domain']}")
@@ -1101,8 +1221,10 @@ def show_agent_setup(state: dict | None = None, *, include_token: bool = False) 
 
 
 def hy2_uri(role: str) -> str:
-    state = json.loads(STATE.read_text(encoding="utf-8"))
-    credentials = json.loads(SECRETS.read_text(encoding="utf-8"))
+    state = load_state()
+    if not role_is_configured(state, role):
+        raise InstallError("该节点尚未设置")
+    credentials = load_secrets()
     external = state["ports"][f"{role}_external_udp"]
     query = urllib.parse.urlencode({
         "sni": state["domain"], "insecure": "0", "alpn": "h3", "obfs": "salamander",
@@ -1114,7 +1236,13 @@ def hy2_uri(role: str) -> str:
 
 def status() -> None:
     system = require_root_supported()
-    for name in [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]:
+    state = load_state()
+    names = [SERVICE_SPECS[role]["name"] for role in configured_roles(state)]
+    if agent_is_configured(state):
+        names.append("xui-agent")
+    if not names:
+        print("尚未设置节点或 Agent。")
+    for name in names:
         result = run(service_argv(system, name, "status"), check=False, capture=True)
         print(f"{name}: {'started' if result.returncode == 0 else 'stopped/error'}")
     if XRAY_BINARY.exists():
@@ -1124,24 +1252,36 @@ def status() -> None:
 
 def print_links() -> None:
     if not STATE.exists() or not SECRETS.exists():
-        raise InstallError("尚未完成安装")
-    print("直连：", hy2_uri("direct"))
-    print("中转落地（提供给美国出站）：", hy2_uri("relay"))
+        raise InstallError("尚未完成基础设置")
+    state = load_state()
+    roles = configured_roles(state)
+    if not roles:
+        raise InstallError("尚未设置节点；请选择 2. 设置节点")
+    if "direct" in roles:
+        print("直连：", hy2_uri("direct"))
+    if "relay" in roles:
+        print("中转落地（提供给美国出站）：", hy2_uri("relay"))
 
 
 def print_agent_setup() -> None:
     if not STATE.exists() or not SECRETS.exists():
-        raise InstallError("尚未完成安装")
+        raise InstallError("尚未完成基础设置")
     show_agent_setup(include_token=True)
+
+
+def show_status_and_mapping() -> None:
+    status()
+    show_mapping()
 
 
 def menu() -> None:
     actions = {
-        "1": ("全新安装/重装", install_all),
-        "2": ("查看服务状态", status),
-        "3": ("查看端口配置/映射", show_mapping),
-        "4": ("显示节点链接（包含敏感凭据）", print_links),
-        "5": ("显示 Agent 接入信息（包含敏感凭据）", print_agent_setup),
+        "1": ("全新设置（基础环境、域名和证书）", setup_base),
+        "2": ("设置节点", configure_node),
+        "3": ("查看节点连接（包含敏感凭据）", print_links),
+        "4": ("查看服务状态/端口映射", show_status_and_mapping),
+        "5": ("设置 Agent", configure_agent),
+        "6": ("查看 Agent 接入信息（包含敏感凭据）", print_agent_setup),
     }
     while True:
         print(f"\nXray NAT 节点管理器 v{VERSION}")
