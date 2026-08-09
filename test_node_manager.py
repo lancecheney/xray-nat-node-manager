@@ -1,4 +1,6 @@
 import io
+import hashlib
+import os
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +12,41 @@ import node_manager as nm
 
 
 class ConfigTests(unittest.TestCase):
+    def test_acme_installer_runs_from_extracted_source_directory(self):
+        archive = b"fixture archive"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "acme.sh-3.1.4"
+            source.mkdir()
+            installer = source / "acme.sh"
+            installer.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "test -f ./acme.sh || { echo \"cp: can't stat 'acme.sh'\" >&2; exit 1; }\n"
+                "home=\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = --home ]; then shift; home=$1; fi\n"
+                "  shift\n"
+                "done\n"
+                "mkdir -p \"$home\"\n"
+                "cp ./acme.sh \"$home/acme.sh\"\n"
+            )
+            os.chmod(installer, 0o755)
+            acme_home = root / "installed"
+            config_home = root / "config"
+            cert_home = root / "certs"
+            response = io.BytesIO(archive)
+            with mock.patch.object(nm, "ACME_ARCHIVE_SHA256", hashlib.sha256(archive).hexdigest()), \
+                    mock.patch.object(nm, "ACME_HOME", acme_home), \
+                    mock.patch.object(nm, "ACME_CONFIG_HOME", config_home), \
+                    mock.patch.object(nm, "ACME_CERT_HOME", cert_home), \
+                    mock.patch.object(nm.urllib.request, "urlopen", return_value=response), \
+                    mock.patch.object(nm, "safe_extract_tar", return_value=source), \
+                    mock.patch.object(nm, "ensure_cron_running"):
+                nm.install_acme_client({"init": "openrc"}, "")
+
+            self.assertTrue((acme_home / "acme.sh").is_file())
+
     def test_bbr_already_enabled_reports_status_without_prompting(self):
         output = io.StringIO()
         status = {

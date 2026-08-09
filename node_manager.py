@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -66,12 +66,14 @@ class InstallError(RuntimeError):
 
 
 def run(argv: list[str], *, check: bool = True, capture: bool = False,
-        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env: dict[str, str] | None = None,
+        cwd: str | Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv,
         check=check,
         text=True,
         env=env,
+        cwd=cwd,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.STDOUT if capture else None,
     )
@@ -683,7 +685,10 @@ def safe_extract_tar(archive: bytes, destination: Path) -> Path:
                 raise InstallError("acme.sh 压缩包包含不安全路径")
             if member.issym() or member.islnk():
                 raise InstallError("acme.sh 压缩包包含链接，拒绝安装")
-        package.extractall(destination, members=members)
+        try:
+            package.extractall(destination, members=members, filter="data")
+        except TypeError:
+            package.extractall(destination, members=members)
     directories = [path for path in destination.iterdir() if path.is_dir()]
     if len(directories) != 1 or not (directories[0] / "acme.sh").is_file():
         raise InstallError("acme.sh 压缩包结构无效")
@@ -719,7 +724,7 @@ def install_acme_client(system: dict[str, str], email: str) -> None:
                 "--no-profile"]
         if email:
             argv += ["--email", email]
-        run(argv)
+        run(argv, cwd=source)
     if not (ACME_HOME / "acme.sh").is_file():
         raise InstallError("acme.sh 安装后入口不存在")
     ACME_CONFIG_HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
