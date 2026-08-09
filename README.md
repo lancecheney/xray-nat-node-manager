@@ -12,6 +12,7 @@
 - 支持 Alpine + OpenRC、Debian/Ubuntu + systemd，安装命令与菜单完全相同。
 - 支持 `x86_64`；仓库加入 arm64 Agent 后也支持 `aarch64`。
 - 需要事先准备域名对应的有效 TLS 完整证书与私钥。
+- 节点身份可以填写域名或 IP，但证书 SAN 必须包含相应的 DNS 名称或 IP；通常建议使用域名。
 - NAT 面板映射和 DNS 记录必须由用户在服务商后台完成。
 - 首版不会自动修改美国 3x-ui；安装完成后会输出美国出站所需的中转 HY2 链接。
 
@@ -23,7 +24,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh)
 ```
 
-脚本会下载完整安装包、安装必要依赖并自动进入 `node-manager` 交互菜单。选择 `1. 全新安装/重装`，按提示填写域名、证书路径以及内外端口。
+脚本会下载完整安装包、安装必要依赖并自动进入 `node-manager` 交互菜单。选择 `1. 全新安装/重装` 后，程序会按“节点身份与 TLS、HY2 直连、HY2 中转、Agent”四个区块引导输入，最后汇总确认后才修改系统。
 
 也可以克隆或上传整个仓库后执行：
 

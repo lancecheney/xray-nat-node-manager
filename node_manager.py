@@ -6,9 +6,11 @@ from __future__ import annotations
 import datetime as dt
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import ssl
@@ -21,7 +23,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 XRAY_VERSION = "26.7.28"
 ROOT = Path("/etc/xray-nat-node-manager")
 STATE = ROOT / "state.json"
@@ -111,6 +113,35 @@ def prompt_port(text: str, default: int) -> int:
     if not 1 <= value <= 65535:
         raise InstallError(f"端口超出范围：{value}")
     return value
+
+
+def normalize_node_identity(value: str) -> str:
+    value = value.strip().rstrip(".")
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    try:
+        domain = value.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise InstallError(f"节点域名无效：{value}") from exc
+    labels = domain.split(".")
+    label_pattern = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    if len(domain) > 253 or len(labels) < 2 or any(not label_pattern.fullmatch(label) for label in labels):
+        raise InstallError(f"节点域名无效：{value}")
+    return domain
+
+
+def is_ip_identity(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def uri_host(value: str) -> str:
+    return f"[{value}]" if ":" in value else value
 
 
 def yes_no(text: str, default: bool = False) -> bool:
@@ -381,9 +412,10 @@ def make_agent_cert(domain: str) -> tuple[str, str]:
     ROOT.mkdir(parents=True, exist_ok=True)
     cert = ROOT / "agent.crt"
     key = ROOT / "agent.key"
+    san_type = "IP" if is_ip_identity(domain) else "DNS"
     run([
         "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "825", "-nodes",
-        "-subj", f"/CN={domain}", "-addext", f"subjectAltName=DNS:{domain}",
+        "-subj", f"/CN={domain}", "-addext", f"subjectAltName={san_type}:{domain}",
         "-keyout", str(key), "-out", str(cert),
     ])
     os.chmod(key, 0o600)
@@ -391,12 +423,29 @@ def make_agent_cert(domain: str) -> tuple[str, str]:
     return str(cert), str(key)
 
 
-def validate_cert_paths(cert: str, key: str) -> None:
+def validate_cert_paths(cert: str, key: str, identity: str) -> None:
     if not Path(cert).is_file() or not Path(key).is_file():
         raise InstallError("TLS 证书或私钥文件不存在")
     result = run(["openssl", "x509", "-in", cert, "-noout"], check=False, capture=True)
     if result.returncode != 0:
         raise InstallError("TLS 证书无法解析")
+    if run(["openssl", "x509", "-in", cert, "-noout", "-checkend", "0"], check=False, capture=True).returncode != 0:
+        raise InstallError("TLS 证书已经过期")
+    try:
+        decoded = ssl._ssl._test_decode_cert(cert)
+        san_kind = "IP Address" if is_ip_identity(identity) else "DNS"
+        if not any(kind == san_kind for kind, _ in decoded.get("subjectAltName", ())):
+            raise ssl.CertificateError("required SAN type is missing")
+        ssl.match_hostname(decoded, identity)
+    except (OSError, ValueError, ssl.CertificateError) as exc:
+        kind = "IP" if is_ip_identity(identity) else "域名"
+        raise InstallError(f"TLS 证书的 SAN 不包含节点{kind}：{identity}") from exc
+    cert_public = run(["openssl", "x509", "-in", cert, "-pubkey", "-noout"], check=False, capture=True)
+    key_public = run(["openssl", "pkey", "-in", key, "-pubout"], check=False, capture=True)
+    if cert_public.returncode != 0 or key_public.returncode != 0:
+        raise InstallError("TLS 私钥无法解析")
+    if cert_public.stdout.strip() != key_public.stdout.strip():
+        raise InstallError("TLS 证书与私钥不匹配")
 
 
 def backup_paths(paths: list[Path]) -> Path:
@@ -464,17 +513,25 @@ def check_port_conflicts(ports: list[tuple[int, str]]) -> None:
 
 
 def collect_install_answers() -> dict:
-    domain = prompt("节点域名")
+    print("\n[1/4] 节点身份与 TLS")
+    domain = normalize_node_identity(prompt("节点域名或 IP（必须被证书 SAN 覆盖）"))
+    cert = prompt("HY2 TLS 完整证书路径", "/etc/ssl/node/fullchain.pem")
+    key = prompt("HY2 TLS 私钥路径", "/etc/ssl/node/key.pem")
+    validate_cert_paths(cert, key, domain)
+
+    print("\n[2/4] HY2 直连端口")
     direct_internal = prompt_port("HY2 直连内部 UDP 端口", 5201)
     direct_external = prompt_port("HY2 直连外部 UDP 端口", 45066)
+
+    print("\n[3/4] HY2 中转落地端口")
     relay_internal = prompt_port("HY2 中转内部 UDP 端口", 24443)
     relay_external = prompt_port("HY2 中转外部 UDP 端口", 58350)
+
+    print("\n[4/4] Agent 管理端口")
     agent_internal = prompt_port("Agent 内部 TCP 端口", 5201)
     agent_external = prompt_port("Agent 外部 TCP 端口", 45066)
     check_port_conflicts([(direct_internal, "udp"), (relay_internal, "udp"), (agent_internal, "tcp")])
-    cert = prompt("HY2 TLS 完整证书路径", "/etc/ssl/node/fullchain.pem")
-    key = prompt("HY2 TLS 私钥路径", "/etc/ssl/node/key.pem")
-    validate_cert_paths(cert, key)
+    check_port_conflicts([(direct_external, "udp"), (relay_external, "udp"), (agent_external, "tcp")])
     return {
         "domain": domain,
         "cert": cert,
@@ -495,6 +552,13 @@ def install_all() -> None:
     if STATE.exists() and not yes_no("检测到已有安装，是否覆盖并先备份", False):
         return
     answers = collect_install_answers()
+    print("\n即将安装：")
+    print(f"  节点身份：{answers['domain']}")
+    print(f"  TLS 证书：{answers['cert']}")
+    show_mapping(answers)
+    if not yes_no("确认以上配置并开始安装", False):
+        print("已取消，未修改系统")
+        return
     packaged_agent = Path(__file__).resolve().parent / "assets" / xray_asset_for_agent()
     if not packaged_agent.is_file():
         raise InstallError(f"安装包缺少 Agent：{packaged_agent}")
@@ -613,7 +677,7 @@ def hy2_uri(role: str) -> str:
         "obfs-password": credentials[f"{role}_obfs_password"],
     })
     auth = urllib.parse.quote(credentials[f"{role}_auth"], safe="")
-    return f"hysteria2://{auth}@{state['domain']}:{external}/?{query}"
+    return f"hysteria2://{auth}@{uri_host(state['domain'])}:{external}/?{query}"
 
 
 def status() -> None:
