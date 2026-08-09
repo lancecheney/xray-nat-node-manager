@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive Alpine NAT node manager for two isolated Xray HY2 services."""
+"""Interactive lightweight NAT node manager for two isolated Xray HY2 services."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 XRAY_VERSION = "26.7.28"
 ROOT = Path("/etc/xray-nat-node-manager")
 STATE = ROOT / "state.json"
@@ -63,15 +63,36 @@ def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subpro
     )
 
 
-def require_root_alpine() -> None:
+def parse_os_release(content: str) -> dict[str, str]:
+    result = {}
+    for line in content.splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        result[key] = value.strip().strip('"').strip("'")
+    return result
+
+
+def detect_system(os_release_path: Path = Path("/etc/os-release")) -> dict[str, str]:
+    release = parse_os_release(os_release_path.read_text(encoding="utf-8"))
+    os_id = release.get("ID", "").lower()
+    if os_id == "alpine":
+        return {"os": "alpine", "init": "openrc"}
+    if os_id in {"debian", "ubuntu"}:
+        return {"os": os_id, "init": "systemd"}
+    raise InstallError(f"不支持的系统：{os_id or 'unknown'}")
+
+
+def require_root_supported() -> dict[str, str]:
     if os.geteuid() != 0:
         raise InstallError("请使用 root 运行")
-    os_release = Path("/etc/os-release").read_text(encoding="utf-8")
-    if "ID=alpine" not in os_release:
-        raise InstallError("首版仅支持 Alpine Linux")
-    for command in ("rc-service", "rc-update", "openssl"):
+    system = detect_system()
+    commands = ["openssl"]
+    commands += ["rc-service", "rc-update"] if system["init"] == "openrc" else ["systemctl"]
+    for command in commands:
         if shutil.which(command) is None:
             raise InstallError(f"缺少命令：{command}")
+    return system
 
 
 def prompt(text: str, default: str | None = None, *, secret: bool = False) -> str:
@@ -120,6 +141,19 @@ def write_atomic(path: Path, content: str | bytes, mode: int) -> None:
             os.unlink(candidate)
 
 
+def copy_atomic(source: Path, path: Path, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, candidate = tempfile.mkstemp(prefix=".node-manager-copy-", dir=path.parent)
+    os.close(fd)
+    try:
+        shutil.copyfile(source, candidate)
+        os.chmod(candidate, mode)
+        os.replace(candidate, path)
+    finally:
+        if os.path.exists(candidate):
+            os.unlink(candidate)
+
+
 def json_write(path: Path, value: object, mode: int = 0o600) -> None:
     write_atomic(path, json.dumps(value, indent=2, ensure_ascii=False) + "\n", mode)
 
@@ -152,19 +186,23 @@ def download_xray(version: str, destination: Path) -> None:
     expected = str(asset.get("digest") or "")
     if not expected.startswith("sha256:"):
         raise InstallError("GitHub API 未提供官方 SHA-256，拒绝安装")
-    with urllib.request.urlopen(asset["browser_download_url"], timeout=120) as response:
-        archive = response.read()
-    if hashlib.sha256(archive).hexdigest() != expected.removeprefix("sha256:"):
-        raise InstallError("Xray 下载文件 SHA-256 不匹配")
     with tempfile.TemporaryDirectory() as directory:
         archive_path = Path(directory) / name
-        archive_path.write_bytes(archive)
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(asset["browser_download_url"], timeout=120) as response:
+            with archive_path.open("wb") as archive_handle:
+                while chunk := response.read(1024 * 1024):
+                    digest.update(chunk)
+                    archive_handle.write(chunk)
+        if digest.hexdigest() != expected.removeprefix("sha256:"):
+            raise InstallError("Xray 下载文件 SHA-256 不匹配")
         with zipfile.ZipFile(archive_path) as package:
             member = next((item for item in package.namelist() if Path(item).name == "xray"), None)
             if member is None:
                 raise InstallError("官方压缩包中没有 xray")
-            binary = package.read(member)
-    write_atomic(destination, binary, 0o755)
+            with package.open(member) as source, destination.open("wb") as output:
+                shutil.copyfileobj(source, output, 1024 * 1024)
+    os.chmod(destination, 0o755)
 
 
 def quic_settings() -> dict:
@@ -274,6 +312,71 @@ depend() {{ need net; after firewall; }}
 '''
 
 
+def systemd_service(name: str, config: Path) -> str:
+    return f'''[Unit]
+Description=Xray HY2 managed by xray-nat-node-manager ({name})
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={XRAY_BINARY} run -c {config}
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+
+def agent_systemd() -> str:
+    return f'''[Unit]
+Description=Lightweight 3x-ui compatible node agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={AGENT_BINARY} -config {AGENT_CONFIG}
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+
+def service_file(system: dict[str, str], name: str) -> Path:
+    if system["init"] == "openrc":
+        return Path("/etc/init.d") / name
+    return Path("/etc/systemd/system") / f"{name}.service"
+
+
+def service_definition(system: dict[str, str], name: str, config: Path | None = None) -> str:
+    if system["init"] == "openrc":
+        return agent_openrc() if name == "xui-agent" else openrc_service(name, config)
+    return agent_systemd() if name == "xui-agent" else systemd_service(name, config)
+
+
+def service_argv(system: dict[str, str], name: str, action: str) -> list[str]:
+    if system["init"] == "openrc":
+        return [shutil.which("rc-service") or "/sbin/rc-service", name, action]
+    return [shutil.which("systemctl") or "/bin/systemctl", action, name]
+
+
+def service_enable_argv(system: dict[str, str], name: str) -> list[str]:
+    if system["init"] == "openrc":
+        return [shutil.which("rc-update") or "/sbin/rc-update", "add", name, "default"]
+    return [shutil.which("systemctl") or "/bin/systemctl", "enable", name]
+
+
+def service_daemon_reload(system: dict[str, str]) -> None:
+    if system["init"] == "systemd":
+        run([shutil.which("systemctl") or "/bin/systemctl", "daemon-reload"])
+
+
 def make_agent_cert(domain: str) -> tuple[str, str]:
     ROOT.mkdir(parents=True, exist_ok=True)
     cert = ROOT / "agent.crt"
@@ -323,10 +426,10 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def restore_backup(target: Path) -> None:
+def restore_backup(target: Path, system: dict[str, str]) -> None:
     manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
     for name in [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]:
-        run(["rc-service", name, "stop"], check=False, capture=True)
+        run(service_argv(system, name, "stop"), check=False, capture=True)
     for record in manifest:
         path = Path(record["path"])
         remove_path(path)
@@ -338,9 +441,10 @@ def restore_backup(target: Path) -> None:
             shutil.copytree(source, path)
         else:
             shutil.copy2(source, path)
+    service_daemon_reload(system)
     for name in [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]:
-        if (Path("/etc/init.d") / name).exists():
-            run(["rc-service", name, "start"], check=False, capture=True)
+        if service_file(system, name).exists():
+            run(service_argv(system, name, "start"), check=False, capture=True)
 
 
 def validate_xray(configs: list[Path]) -> None:
@@ -387,7 +491,7 @@ def collect_install_answers() -> dict:
 
 
 def install_all() -> None:
-    require_root_alpine()
+    system = require_root_supported()
     if STATE.exists() and not yes_no("检测到已有安装，是否覆盖并先备份", False):
         return
     answers = collect_install_answers()
@@ -397,10 +501,10 @@ def install_all() -> None:
 
     managed = [
         ROOT, AGENT_CONFIG.parent, AGENT_STATE.parent, XRAY_BINARY, AGENT_BINARY,
-        Path("/etc/init.d/xui-agent"),
+        service_file(system, "xui-agent"),
     ]
     for spec in SERVICE_SPECS.values():
-        managed += [spec["config"].parent, Path("/etc/init.d") / spec["name"]]
+        managed += [spec["config"].parent, service_file(system, spec["name"])]
     backup = backup_paths(managed)
     print(f"备份：{backup}")
 
@@ -409,7 +513,7 @@ def install_all() -> None:
     candidate_xray = Path(candidate_name)
     try:
         download_xray(XRAY_VERSION, candidate_xray)
-        write_atomic(XRAY_BINARY, candidate_xray.read_bytes(), 0o755)
+        copy_atomic(candidate_xray, XRAY_BINARY, 0o755)
 
         credentials = {
             "agent_token": secrets.token_hex(32),
@@ -426,19 +530,19 @@ def install_all() -> None:
                 auth=credentials[f"{role}_auth"], obfs_password=credentials[f"{role}_obfs_password"], spec=spec,
             )
             json_write(spec["config"], config)
-            write_atomic(Path("/etc/init.d") / spec["name"], openrc_service(spec["name"], spec["config"]), 0o755)
+            write_atomic(service_file(system, spec["name"]), service_definition(system, spec["name"], spec["config"]), 0o755 if system["init"] == "openrc" else 0o644)
             configs.append(spec["config"])
         validate_xray(configs)
 
-        write_atomic(AGENT_BINARY, packaged_agent.read_bytes(), 0o755)
+        copy_atomic(packaged_agent, AGENT_BINARY, 0o755)
         agent_cert, agent_key = make_agent_cert(answers["domain"])
         services = []
         for role, spec in SERVICE_SPECS.items():
             services.append({
                 "name": spec["name"], "binary": str(XRAY_BINARY), "configPath": str(spec["config"]),
                 "apiEndpoint": f"127.0.0.1:{spec['api_port']}",
-                "restartCommand": ["/sbin/rc-service", spec["name"], "restart"],
-                "statusCommand": ["/sbin/rc-service", spec["name"], "status"],
+                "restartCommand": service_argv(system, spec["name"], "restart"),
+                "statusCommand": service_argv(system, spec["name"], "status"),
                 "ignoreTags": ["api"], "default": role == "direct",
             })
         agent = {
@@ -451,23 +555,25 @@ def install_all() -> None:
             "services": services,
         }
         json_write(AGENT_CONFIG, agent)
-        write_atomic(Path("/etc/init.d/xui-agent"), agent_openrc(), 0o755)
+        write_atomic(service_file(system, "xui-agent"), service_definition(system, "xui-agent"), 0o755 if system["init"] == "openrc" else 0o644)
+        service_daemon_reload(system)
         AGENT_STATE.parent.mkdir(parents=True, exist_ok=True)
         run([str(AGENT_BINARY), "-config", str(AGENT_CONFIG), "-adopt"])
         run([str(AGENT_BINARY), "-config", str(AGENT_CONFIG), "-check"])
 
         for spec in SERVICE_SPECS.values():
-            run(["rc-update", "add", spec["name"], "default"], check=False)
-            run(["rc-service", spec["name"], "restart"])
-            run(["rc-service", spec["name"], "status"])
-        run(["rc-update", "add", "xui-agent", "default"], check=False)
-        run(["rc-service", "xui-agent", "restart"])
-        run(["rc-service", "xui-agent", "status"])
+            run(service_enable_argv(system, spec["name"]), check=False)
+            run(service_argv(system, spec["name"], "restart"))
+            run(service_argv(system, spec["name"], "status"))
+        run(service_enable_argv(system, "xui-agent"), check=False)
+        run(service_argv(system, "xui-agent", "restart"))
+        run(service_argv(system, "xui-agent", "status"))
 
         ROOT.mkdir(parents=True, exist_ok=True)
         json_write(SECRETS, credentials)
         answers["installed_at"] = stamp()
         answers["xray_version"] = XRAY_VERSION
+        answers["system"] = system
         answers["agent_sha256"] = sha256(packaged_agent)
         json_write(STATE, answers)
         print("安装完成。请在 NAT 面板添加以下映射：")
@@ -475,7 +581,7 @@ def install_all() -> None:
         print(f"敏感凭据只保存在：{SECRETS}")
     except Exception:
         print(f"安装失败，正在恢复：{backup}", file=sys.stderr)
-        restore_backup(backup)
+        restore_backup(backup, system)
         raise
     finally:
         candidate_xray.unlink(missing_ok=True)
@@ -511,9 +617,9 @@ def hy2_uri(role: str) -> str:
 
 
 def status() -> None:
-    require_root_alpine()
+    system = require_root_supported()
     for name in [spec["name"] for spec in SERVICE_SPECS.values()] + ["xui-agent"]:
-        result = run(["rc-service", name, "status"], check=False, capture=True)
+        result = run(service_argv(system, name, "status"), check=False, capture=True)
         print(f"{name}: {'started' if result.returncode == 0 else 'stopped/error'}")
     if XRAY_BINARY.exists():
         result = run([str(XRAY_BINARY), "version"], check=False, capture=True)
