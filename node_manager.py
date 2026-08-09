@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -259,12 +259,19 @@ def collect_tls_answers(identity: str, network: dict) -> dict:
         print("  3. 权限：Zone > DNS > Edit")
         print("  4. Zone Resources：Include > Specific zone > 选择当前域名所在区域")
         print("  5. 在该 Zone 的 Overview 页面右侧复制 Zone ID")
-        print("  6. Token 只显示一次，请先保存；下方隐藏输入只粘贴 Token 本体")
-        zone_id = prompt("Cloudflare Zone ID（32 位）")
+        print("  6. 接下来先粘贴 Token，再粘贴 Zone ID；两项均隐藏输入")
+        token = prompt("Cloudflare API Token（隐藏输入）", secret=True)
+        if re.fullmatch(r"[0-9a-fA-F]{32}", token):
+            raise InstallError("这里需要 API Token；你粘贴的看起来是 Zone ID")
+        if len(token) < 20 or any(character.isspace() for character in token):
+            raise InstallError("Cloudflare API Token 格式无效")
+        zone_id = prompt("Cloudflare Zone ID（隐藏输入，32 位）", secret=True)
         if not re.fullmatch(r"[0-9a-fA-F]{32}", zone_id):
+            if zone_id.startswith("cfut_"):
+                raise InstallError("这里需要 Zone ID；你粘贴的看起来是 API Token")
             raise InstallError("Cloudflare Zone ID 应为 32 位十六进制字符")
         result["cf_zone_id"] = zone_id.lower()
-        result["_cf_token"] = prompt("Cloudflare API Token（隐藏输入）", secret=True)
+        result["_cf_token"] = token
     else:
         external = 80 if method == "http" else 443
         if network["mode"] == "mapped":

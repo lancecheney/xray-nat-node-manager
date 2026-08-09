@@ -70,19 +70,26 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(tls["internal_tcp"], 80)
 
     def test_cloudflare_prompt_explains_scoped_token_and_collects_zone_id(self):
-        answers = iter(["1", "a" * 32, "admin@example.com"])
+        answers = iter(["1", "admin@example.com"])
         output = io.StringIO()
         with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
-                mock.patch("getpass.getpass", return_value="secret-token"), \
+                mock.patch("getpass.getpass", side_effect=["secret-cloudflare-token-value", "a" * 32]), \
                 redirect_stdout(output):
             tls = nm.collect_tls_answers("node.example.com", {"mode": "mapped"})
 
         self.assertEqual(tls["cf_zone_id"], "a" * 32)
-        self.assertEqual(tls["_cf_token"], "secret-token")
+        self.assertEqual(tls["_cf_token"], "secret-cloudflare-token-value")
         rendered = output.getvalue()
         self.assertIn("https://dash.cloudflare.com/profile/api-tokens", rendered)
         self.assertIn("Zone > DNS > Edit", rendered)
         self.assertIn("不要使用 Global API Key", rendered)
+
+    def test_cloudflare_credentials_explain_when_token_and_zone_are_swapped(self):
+        answers = iter(["1"])
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+                mock.patch("getpass.getpass", side_effect=["secret-cloudflare-token-value", "cfut_wrong-field"]):
+            with self.assertRaisesRegex(nm.InstallError, "需要 Zone ID"):
+                nm.collect_tls_answers("node.example.com", {"mode": "mapped"})
 
     def test_agent_setup_uses_public_port_and_https(self):
         output = io.StringIO()
