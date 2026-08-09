@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -649,6 +649,41 @@ def service_daemon_reload(system: dict[str, str]) -> None:
         run([shutil.which("systemctl") or "/bin/systemctl", "daemon-reload"])
 
 
+def dns_san_matches(pattern: str, hostname: str) -> bool:
+    hostname = normalize_node_identity(hostname)
+    pattern = pattern.strip().rstrip(".").lower()
+    if "*" not in pattern:
+        try:
+            return pattern.encode("idna").decode("ascii") == hostname
+        except UnicodeError:
+            return False
+    if not pattern.startswith("*.") or pattern.count("*") != 1:
+        return False
+    try:
+        suffix = normalize_node_identity(pattern[2:])
+    except InstallError:
+        return False
+    labels = hostname.split(".")
+    suffix_labels = suffix.split(".")
+    return len(labels) == len(suffix_labels) + 1 and labels[1:] == suffix_labels
+
+
+def certificate_san_matches(decoded: dict, identity: str) -> bool:
+    sans = decoded.get("subjectAltName", ())
+    if is_ip_identity(identity):
+        expected = ipaddress.ip_address(identity)
+        for kind, value in sans:
+            if kind != "IP Address":
+                continue
+            try:
+                if ipaddress.ip_address(value) == expected:
+                    return True
+            except ValueError:
+                continue
+        return False
+    return any(kind == "DNS" and dns_san_matches(value, identity) for kind, value in sans)
+
+
 def validate_cert_paths(cert: str, key: str, identity: str) -> None:
     if not Path(cert).is_file() or not Path(key).is_file():
         raise InstallError("TLS 证书或私钥文件不存在")
@@ -659,10 +694,8 @@ def validate_cert_paths(cert: str, key: str, identity: str) -> None:
         raise InstallError("TLS 证书已经过期")
     try:
         decoded = ssl._ssl._test_decode_cert(cert)
-        san_kind = "IP Address" if is_ip_identity(identity) else "DNS"
-        if not any(kind == san_kind for kind, _ in decoded.get("subjectAltName", ())):
-            raise ssl.CertificateError("required SAN type is missing")
-        ssl.match_hostname(decoded, identity)
+        if not certificate_san_matches(decoded, identity):
+            raise ssl.CertificateError("required identity is missing from SAN")
     except (OSError, ValueError, ssl.CertificateError) as exc:
         kind = "IP" if is_ip_identity(identity) else "域名"
         raise InstallError(f"TLS 证书的 SAN 不包含节点{kind}：{identity}") from exc
@@ -785,7 +818,11 @@ def issue_certificate(system: dict[str, str], identity: str, tls: dict) -> tuple
     issue_args = acme_validation_args(identity, tls)
     with tempfile.TemporaryDirectory(prefix="acme-staging-", dir="/tmp") as directory:
         staging = Path(directory)
-        run([*acme_command(staging / "config", staging / "certs"), "--server", "letsencrypt_test",
+        staging_config = staging / "config"
+        staging_certs = staging / "certs"
+        staging_config.mkdir(mode=0o700)
+        staging_certs.mkdir(mode=0o700)
+        run([*acme_command(staging_config, staging_certs), "--server", "letsencrypt_test",
              *issue_args], env=environment)
     run([*acme_command(), "--server", "letsencrypt", *issue_args], env=environment)
 

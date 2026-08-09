@@ -355,6 +355,20 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(nm.InstallError):
             nm.normalize_node_identity("not_a_domain")
 
+    def test_certificate_san_matching_supports_exact_wildcard_and_ip(self):
+        self.assertTrue(nm.certificate_san_matches(
+            {"subjectAltName": (("DNS", "node.example.com"),)}, "node.example.com",
+        ))
+        self.assertTrue(nm.certificate_san_matches(
+            {"subjectAltName": (("DNS", "*.example.com"),)}, "node.example.com",
+        ))
+        self.assertFalse(nm.certificate_san_matches(
+            {"subjectAltName": (("DNS", "*.example.com"),)}, "deep.node.example.com",
+        ))
+        self.assertTrue(nm.certificate_san_matches(
+            {"subjectAltName": (("IP Address", "2001:db8::1"),)}, "2001:0db8::1",
+        ))
+
     def test_certificate_identity_and_private_key_are_verified(self):
         with tempfile.TemporaryDirectory() as directory:
             cert = Path(directory) / "cert.pem"
@@ -371,6 +385,8 @@ class ConfigTests(unittest.TestCase):
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             nm.validate_cert_paths(str(cert), str(key), "node.example.com")
+            with mock.patch.object(nm.ssl, "match_hostname", new=None):
+                nm.validate_cert_paths(str(cert), str(key), "node.example.com")
             with self.assertRaisesRegex(nm.InstallError, "SAN"):
                 nm.validate_cert_paths(str(cert), str(key), "other.example.com")
             with self.assertRaisesRegex(nm.InstallError, "不匹配"):
