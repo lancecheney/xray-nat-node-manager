@@ -29,6 +29,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 ## TLS 与自动续期
 
 - 域名默认推荐 Cloudflare DNS-01，不需要公网 80/443；API Token 使用隐藏输入。
+- Cloudflare 流程会显示官方 Token 创建入口，并要求只授予当前 Zone 的 `Zone > DNS > Edit`；同时输入该 Zone Overview 页面中的 32 位 Zone ID。不要使用 Global API Key。
 - HTTP-01 的公网验证端口固定为 TCP 80；NAT 模式可将它映射到手动填写的内部 TCP 端口。
 - IP 证书还可使用 TLS-ALPN-01，其公网验证端口固定为 TCP 443；NAT 模式可映射到其他内部 TCP 端口。
 - 自动申请使用固定并校验 SHA-256 的 `acme.sh 3.1.4`，先通过 Let’s Encrypt 测试环境，再申请正式证书。

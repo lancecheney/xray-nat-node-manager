@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 XRAY_VERSION = "26.7.28"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
@@ -253,7 +253,18 @@ def collect_tls_answers(identity: str, network: dict) -> dict:
         result.update({"cert": cert, "key": key})
         return result
     if method == "cloudflare":
-        result["_cf_token"] = prompt("Cloudflare API Token", secret=True)
+        print("\nCloudflare Token 获取方法：")
+        print("  1. 打开 https://dash.cloudflare.com/profile/api-tokens")
+        print("  2. 创建自定义 Token（不要使用 Global API Key）")
+        print("  3. 权限：Zone > DNS > Edit")
+        print("  4. Zone Resources：Include > Specific zone > 选择当前域名所在区域")
+        print("  5. 在该 Zone 的 Overview 页面右侧复制 Zone ID")
+        print("  6. Token 只显示一次，请先保存；下方隐藏输入只粘贴 Token 本体")
+        zone_id = prompt("Cloudflare Zone ID（32 位）")
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", zone_id):
+            raise InstallError("Cloudflare Zone ID 应为 32 位十六进制字符")
+        result["cf_zone_id"] = zone_id.lower()
+        result["_cf_token"] = prompt("Cloudflare API Token（隐藏输入）", secret=True)
     else:
         external = 80 if method == "http" else 443
         if network["mode"] == "mapped":
@@ -661,6 +672,7 @@ def issue_certificate(system: dict[str, str], identity: str, tls: dict) -> tuple
     token = tls.get("_cf_token")
     if token:
         environment["CF_Token"] = token
+        environment["CF_Zone_ID"] = tls["cf_zone_id"]
     issue_args = acme_validation_args(identity, tls)
     with tempfile.TemporaryDirectory(prefix="acme-staging-", dir="/tmp") as directory:
         staging = Path(directory)

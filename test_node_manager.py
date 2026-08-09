@@ -69,6 +69,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(tls["external_tcp"], 80)
         self.assertEqual(tls["internal_tcp"], 80)
 
+    def test_cloudflare_prompt_explains_scoped_token_and_collects_zone_id(self):
+        answers = iter(["1", "a" * 32, "admin@example.com"])
+        output = io.StringIO()
+        with mock.patch("builtins.input", side_effect=lambda _: next(answers)), \
+                mock.patch("getpass.getpass", return_value="secret-token"), \
+                redirect_stdout(output):
+            tls = nm.collect_tls_answers("node.example.com", {"mode": "mapped"})
+
+        self.assertEqual(tls["cf_zone_id"], "a" * 32)
+        self.assertEqual(tls["_cf_token"], "secret-token")
+        rendered = output.getvalue()
+        self.assertIn("https://dash.cloudflare.com/profile/api-tokens", rendered)
+        self.assertIn("Zone > DNS > Edit", rendered)
+        self.assertIn("不要使用 Global API Key", rendered)
+
     def test_agent_setup_uses_public_port_and_https(self):
         output = io.StringIO()
         state = {
