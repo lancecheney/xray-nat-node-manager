@@ -26,7 +26,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh)
 ```
 
-脚本会下载完整安装包、安装必要依赖并自动进入模块化菜单：
+首次安装或显式更新时，脚本会下载完整安装包、安装必要依赖并自动进入模块化菜单；检测到本机已安装且依赖完整时，会直接启动本地管理器，不重复下载完整源码包或执行包管理器（外层 `curl` 仍会获取这几 KB 的安装脚本）：
 
 ```text
 1. 基础设置/修改域名证书
@@ -37,6 +37,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 6. 查看 Agent 接入信息（包含敏感凭据）
 7. 单节点三网线路/延迟测试
 0. 退出
+```
+
+安装完成后，日常启动直接运行 `node-manager`（或 `/usr/local/sbin/node-manager`）。如果需要更新到 GitHub `main` 的最新代码，再执行：
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh) --update
 ```
 
 首次使用先选择 `1`，只设置 Linux TCP BBR、节点地址、端口方式和 TLS 证书，不再强制一次填写节点与 Agent 端口。基础设置完成后再次选择 `1`，可以修改节点域名和 TLS 证书；现有节点端口、凭据和 Agent Token 保持不变，HY2 与 Agent 配置会验证后自动切换到新证书。端口方式不在修改流程中重选，避免破坏已有 NAT 映射。随后选择 `2`，按需创建“HY2 直连”“HY2 中转落地（供中转接入）”或“VLESS + Reality”独立服务；选择 `5` 再设置 Agent。Agent 接入 3x-ui 总面板后，已有入站和客户端统一在总面板调整，脚本不再提供重复的节点修改入口。以后需要增加尚未创建的节点类型，仍可通过 `2` 创建；公网外部端口映射始终由 NAT 服务商后台管理。
