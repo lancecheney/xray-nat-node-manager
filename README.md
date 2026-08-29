@@ -43,12 +43,6 @@ node-manager
 /usr/local/sbin/node-manager
 ```
 
-如果需要强制重新下载当前版本，可使用：
-
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh) --update
-```
-
 也可以克隆或上传仓库后执行：
 
 ```sh
