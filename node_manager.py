@@ -123,11 +123,13 @@ ROUTE_LINES = {
     "ct": (
         ("4809", "CN2", "China Telecom Next Generation"),
         ("4134", "163", "ChinaNet 骨干网"),
+        ("4812", "上海省网", "中国电信上海接入网"),
     ),
     "cu": (
         ("9929", "9929", "中国联通精品网"),
         ("10099", "CUG", "China Unicom Global"),
         ("4837", "4837/169", "China Unicom 169 骨干网"),
+        ("140979", "上海省网", "中国联通上海 FuTe IDC 接入网"),
     ),
     "cm": (
         ("58807", "CMIN2", "China Mobile International N2"),
@@ -704,11 +706,46 @@ def trace_hop_geo(hop: dict) -> dict:
 
 
 def trace_hop_asn(hop: dict) -> str | None:
-    value = trace_hop_geo(hop).get("asnumber")
-    if value is None:
-        return None
-    match = re.search(r"\d+", str(value))
-    return match.group(0) if match else None
+    asns = trace_hop_asns(hop)
+    return asns[0] if asns else None
+
+
+def trace_hop_asns(hop: dict) -> list[str]:
+    geo = trace_hop_geo(hop)
+    result = []
+
+    def add(value: object) -> None:
+        value = str(value)
+        for asn in re.findall(r"\bAS\s*(\d{2,10})\b", value, re.IGNORECASE):
+            if asn not in result:
+                result.append(asn)
+
+    # asnumber 常是纯数字，Router/Owner/Hostname 则通常带 AS 前缀。
+    raw_asn = geo.get("asnumber")
+    if raw_asn is not None:
+        match = re.search(r"\d{2,10}", str(raw_asn))
+        if match:
+            result.append(match.group(0))
+    router = geo.get("router")
+    add(router)
+    add(hop.get("Hostname") or hop.get("hostname") or "")
+    for field in ("owner", "isp", "whois", "domain", "prefix"):
+        add(geo.get(field) or "")
+
+    text = json.dumps(router, ensure_ascii=False) if router is not None else ""
+    text = f"{text} {json.dumps(geo, ensure_ascii=False)}".upper()
+    # NextTrace 的 CN2-Global/CN2-BackBone 可能只出现在 Router 标签里。
+    inferred = (
+        ("CN2", "4809"), ("9929", "9929"), ("CUG", "10099"),
+        ("4837", "4837"), ("CMIN2", "58807"), ("CMI", "58453"),
+        ("CMNET", "9808"),
+    )
+    for label, asn in inferred:
+        if label == "CMI" and "CMIN2" in text:
+            continue
+        if label in text and asn not in result:
+            result.append(asn)
+    return result
 
 
 def successful_trace_hops(payload: dict) -> list[dict]:
@@ -726,9 +763,9 @@ def successful_trace_hops(payload: dict) -> list[dict]:
 def route_line(carrier: str, hops: list[dict]) -> tuple[str, str, str]:
     path = []
     for hop in hops:
-        asn = trace_hop_asn(hop)
-        if asn and (not path or path[-1] != asn):
-            path.append(asn)
+        for asn in trace_hop_asns(hop):
+            if not path or path[-1] != asn:
+                path.append(asn)
     matches = [line for line in ROUTE_LINES[carrier] if line[0] in path]
     if not matches:
         return "未识别", "未看到该运营商的典型骨干 ASN", " → ".join(f"AS{item}" for item in path) or "无公开 ASN"
@@ -740,9 +777,9 @@ def route_line(carrier: str, hops: list[dict]) -> tuple[str, str, str]:
 def route_line_any(hops: list[dict]) -> tuple[str, str, str]:
     path = []
     for hop in hops:
-        asn = trace_hop_asn(hop)
-        if asn and (not path or path[-1] != asn):
-            path.append(asn)
+        for asn in trace_hop_asns(hop):
+            if not path or path[-1] != asn:
+                path.append(asn)
     matches = []
     for carrier, label in ROUTE_CARRIERS:
         for asn, code, name in ROUTE_LINES[carrier]:
@@ -795,7 +832,12 @@ def route_detour(hops: list[dict], destination_key: str = "CN") -> str:
 
     prefix = located[:5]
     # 起点附近通常 RTT 最低；用它比“首个 GeoIP 标签”更能抵抗首跳误标。
-    source_key = min(prefix, key=lambda item: item[2])[0]
+    source_key = prefix[0][0]
+    # 首个公开跳点才是起点；只有它明显低 RTT 且后续地区重复时，才视为孤立 GeoIP 误标。
+    if len(prefix) >= 3 and sum(item[0] == source_key for item in prefix) == 1:
+        second = prefix[1]
+        if prefix[0][2] <= 3 and prefix[0][2] + 15 < second[2] and sum(item[0] == second[0] for item in prefix) >= 2:
+            source_key = second[0]
     source_rtt = min(item[2] for item in located if item[0] == source_key)
     candidates: dict[str, list[tuple[str, float, int]]] = {}
     for index, (key, label, rtt) in enumerate(located):
@@ -803,8 +845,9 @@ def route_detour(hops: list[dict], destination_key: str = "CN") -> str:
             candidates.setdefault(key, []).append((label, rtt, index))
 
     credible = []
+    regional = []
     ignored = 0
-    for samples in candidates.values():
+    for candidate_key, samples in candidates.items():
         minimum = min(item[1] for item in samples)
         enough_latency = minimum >= 10 and minimum - source_rtt >= 8
         nearby_pair = any(
@@ -812,12 +855,21 @@ def route_detour(hops: list[dict], destination_key: str = "CN") -> str:
             for left, right in zip(samples, samples[1:])
         )
         if len(samples) >= 2 and nearby_pair and enough_latency:
-            credible.append((samples[0][0], minimum, len(samples)))
+            item = (samples[0][0], minimum, len(samples))
+            if (source_key, destination_key, candidate_key) == ("singapore", "CN", "HK"):
+                regional.append(item)
+            else:
+                credible.append(item)
         else:
             ignored += len(samples)
     if credible:
         detail = "、".join(f"{label}（{count} 跳，最低 {rtt:.1f} ms）" for label, rtt, count in credible)
+        if regional:
+            detail += "；另经 " + "、".join(f"{label}（区域中转）" for label, _, _ in regional)
         return f"疑似绕路：经 {detail}；请结合完整路由复核"
+    if regional:
+        detail = "、".join(f"{label}（{count} 跳）" for label, _, count in regional)
+        return f"经过 {detail}；属于可见的区域中转，暂不判定为绕路"
     suffix = f"；已忽略 {ignored} 个孤立或低 RTT 的 GeoIP 标签" if ignored else ""
     return f"未发现可信绕路证据{suffix}"
 

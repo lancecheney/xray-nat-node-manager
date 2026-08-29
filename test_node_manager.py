@@ -902,6 +902,45 @@ class ProvinceRouteTests(unittest.TestCase):
         self.assertEqual(summary["latency"], "18.2 ms")
         self.assertEqual(summary["as_path"], "AS64500 → AS4809 → AS4134")
 
+    def test_route_summary_reads_cn2_router_labels_before_terminal_asn(self):
+        intermediate = self.hop("59.43.247.225", 65.6, "", "中国", "China", "上海")
+        intermediate["Geo"]["router"] = {
+            "CN2-Global": [],
+            "CN2-BackBone": [],
+        }
+        payload = {
+            "Hops": [
+                [intermediate],
+                [self.hop("101.226.94.50", 67.3, "4812", "中国", "China", "上海")],
+            ],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        summary = nm.summarize_route_trace("ct", payload)
+        self.assertEqual(summary["line"], "CN2+上海省网")
+        self.assertIn("AS4809", summary["as_path"])
+        self.assertIn("AS4812", summary["as_path"])
+
+    def test_terminal_shanghai_unicom_asn_is_reported_as_access_network(self):
+        payload = {
+            "Hops": [[self.hop("203.0.113.9", 70, "140979", "中国", "China", "上海")]],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        summary = nm.summarize_route_trace("cu", payload)
+        self.assertEqual(summary["line"], "上海省网")
+        self.assertIn("中国联通上海", summary["name"])
+
+    def test_singapore_to_hong_kong_to_shanghai_is_regional_transit(self):
+        hops = [
+            self.hop("203.174.80.37", 7.5, "4809", "新加坡", "Singapore"),
+            self.hop("69.194.165.5", 40.7, "4809", "中国", "China", "香港"),
+            self.hop("69.194.166.114", 40.3, "4809", "中国", "China", "香港"),
+            self.hop("101.226.94.50", 67.3, "4812", "中国", "China", "上海"),
+        ]
+        result = nm.route_detour(hops)
+        self.assertIn("经过 香港", result)
+        self.assertIn("暂不判定为绕路", result)
+        self.assertNotIn("疑似绕路", result)
+
     def test_custom_ip_summary_recognizes_any_carrier_line(self):
         payload = {
             "Hops": [
