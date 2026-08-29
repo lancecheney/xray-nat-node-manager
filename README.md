@@ -43,6 +43,8 @@ node-manager
 /usr/local/sbin/node-manager
 ```
 
+安装脚本启动交互菜单时会优先读取当前终端；即使使用 `curl ... | bash` 管道方式，也不会把安装脚本内容误当成菜单输入。
+
 也可以克隆或上传仓库后执行：
 
 ```sh

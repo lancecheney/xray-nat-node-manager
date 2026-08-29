@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Keep this in sync with VERSION in node_manager.py.
-MANAGER_VERSION="0.8.0"
+MANAGER_VERSION="0.8.1"
 update_requested=false
 if [ "${1:-}" = "--update" ]; then
   update_requested=true
@@ -60,6 +60,17 @@ install_dependencies() {
   esac
 }
 
+start_manager() {
+  if [ -t 0 ]; then
+    exec /usr/local/sbin/node-manager
+  fi
+  if [ -r /dev/tty ]; then
+    exec /usr/local/sbin/node-manager </dev/tty
+  fi
+  echo "node-manager 需要交互终端，请在 SSH 终端中运行" >&2
+  exit 1
+}
+
 if [ "$update_requested" = false ] \
     && [ -x /usr/local/sbin/node-manager ] \
     && [ -f "$installed_manager" ] \
@@ -68,7 +79,7 @@ if [ "$update_requested" = false ] \
   if ! dependencies_ready; then
     install_dependencies
   fi
-  exec /usr/local/sbin/node-manager
+  start_manager
 fi
 
 base_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -104,4 +115,4 @@ fi
 
 ln -sf /usr/local/lib/xray-nat-node-manager/node_manager.py /usr/local/sbin/node-manager
 echo "安装完成，正在启动 node-manager"
-exec /usr/local/sbin/node-manager
+start_manager
