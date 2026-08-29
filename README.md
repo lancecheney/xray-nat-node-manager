@@ -26,7 +26,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh)
 ```
 
-首次安装或显式更新时，脚本会下载完整安装包、安装必要依赖并自动进入模块化菜单；检测到本机已安装且依赖完整时，会直接启动本地管理器，不重复下载完整源码包或执行包管理器（外层 `curl` 仍会获取这几 KB 的安装脚本）：
+首次安装或检测到版本变化时，脚本会下载完整安装包、安装必要依赖并自动进入模块化菜单；检测到本机已安装、版本一致且依赖完整时，会直接启动本地管理器，不重复下载完整源码包或执行包管理器（外层 `curl` 仍会获取这几 KB 的安装脚本）：
 
 ```text
 1. 基础设置/修改域名证书
@@ -39,7 +39,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 0. 退出
 ```
 
-安装完成后，日常启动直接运行 `node-manager`（或 `/usr/local/sbin/node-manager`）。如果需要更新到 GitHub `main` 的最新代码，再执行：
+安装完成后，日常可以继续使用上面的远程命令：它会自动比较版本，版本变化时更新，版本一致时直接启动。也可以直接运行本地 `node-manager`（或 `/usr/local/sbin/node-manager`）。如果需要强制重新下载当前版本，再执行：
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-manager/main/install.sh) --update

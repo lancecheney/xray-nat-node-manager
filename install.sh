@@ -6,6 +6,8 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Keep this in sync with VERSION in node_manager.py.
+MANAGER_VERSION="0.7.6"
 update_requested=false
 if [ "${1:-}" = "--update" ]; then
   update_requested=true
@@ -17,6 +19,11 @@ fi
 
 install_dir=/usr/local/lib/xray-nat-node-manager
 installed_manager=$install_dir/node_manager.py
+
+installed_manager_version() {
+  [ -f "$installed_manager" ] || return 0
+  sed -n 's/^VERSION = "\([^"]*\)"/\1/p' "$installed_manager" | head -n 1
+}
 
 dependencies_ready() {
   command -v python3 >/dev/null 2>&1 \
@@ -30,6 +37,7 @@ if [ "$update_requested" = false ] \
     && [ -x /usr/local/sbin/node-manager ] \
     && [ -f "$installed_manager" ] \
     && [ -d "$install_dir/assets" ] \
+    && [ "$(installed_manager_version)" = "$MANAGER_VERSION" ] \
     && dependencies_ready; then
   exec /usr/local/sbin/node-manager
 fi
