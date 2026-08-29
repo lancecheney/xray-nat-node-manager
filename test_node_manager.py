@@ -943,7 +943,7 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         summary = nm.summarize_route_trace("cu", payload)
-        self.assertEqual(summary["line"], "CN2")
+        self.assertEqual(summary["line"], "CN2（借道）")
         self.assertEqual(summary["as_path"], "AS4809")
         self.assertNotIn("AS4837", summary["as_path"])
         self.assertIn("借道", summary["transit"])
@@ -1034,6 +1034,7 @@ class ProvinceRouteTests(unittest.TestCase):
         rendered = output.getvalue()
         for carrier in ("中国电信", "中国联通", "中国移动"):
             self.assertIn(carrier, rendered)
+        self.assertNotIn("借道：", rendered)
 
     def test_menu_ip_mode_runs_only_the_entered_target(self):
         payload = {

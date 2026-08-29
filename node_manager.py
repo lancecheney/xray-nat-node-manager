@@ -1025,6 +1025,8 @@ def summarize_route_trace(carrier: str | None, payload: dict) -> dict[str, str]:
     else:
         detour = route_detour(hops)
         transit = route_transit(carrier, hops)
+    if transit.startswith("检测到借道："):
+        line = f"{line}（借道）"
     return {
         "line": line,
         "name": name,
@@ -1055,7 +1057,6 @@ def test_single_province_route() -> None:
             print(f"  延迟：{summary['latency']}")
             print(f"  路径：{summary['as_path']}")
             print(f"  绕路：{summary['detour']}")
-            print(f"  借道：{summary['transit']}")
         except (InstallError, OSError, subprocess.SubprocessError) as exc:
             print(f"\n{label}  测试失败：{exc}")
 
