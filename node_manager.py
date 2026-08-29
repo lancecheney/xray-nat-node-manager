@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.7"
+VERSION = "0.7.8"
 XRAY_VERSION = "26.7.28"
 NEXTTRACE_VERSION = "1.7.3"
 ACME_VERSION = "3.1.4"
