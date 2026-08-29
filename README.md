@@ -50,7 +50,7 @@ chmod +x install.sh node_manager.py
 ./install.sh
 ```
 
-安装脚本只会在依赖缺失时安装 `python3`、`openssl`、`ca-certificates`、`cron/dcron` 和 `socat`。
+安装脚本只会在依赖缺失时安装 `bash`、`curl`、`python3`、`openssl`、`ca-certificates`、`cron/dcron` 和 `socat`。
 
 临时下载目录会在安装流程结束时清理；系统依赖、节点配置、凭据和服务不会因退出菜单而卸载或删除。
 
@@ -64,6 +64,7 @@ chmod +x install.sh node_manager.py
 5. 设置 Agent
 6. 查看 Agent 接入信息（包含敏感凭据）
 7. 单节点三网线路/延迟测试
+8. IP 质量测试（Check.Place）
 0. 退出
 ```
 
@@ -130,6 +131,16 @@ nexttrace -4 -q 1 --parallel-requests 1 -m 25 -n --json --no-color TARGET
 - GeoIP 只作辅助。单个孤立标签或与 RTT 不匹配的标签会被忽略；新加坡→香港→上海这类常见区域中转不会直接判为绕路。
 
 省级目标来自 [oneclickvirt/nt3 的 31 省级路由注册表](https://github.com/oneclickvirt/nt3/blob/main/model/snapshot/province-routes.json)。首次测试若缺少 NextTrace，脚本会从 [NTrace-core 官方发布](https://github.com/nxtrace/NTrace-core/releases)安装固定版本 `nexttrace-tiny v1.7.3`，并校验仓库内记录的官方 SHA-256。
+
+## IP 质量测试
+
+菜单 `8` 执行 Check.Place 提供的 IP 质量检测，等价于：
+
+```sh
+bash <(curl -sL https://Check.Place) -I
+```
+
+该检测会在线下载并执行第三方脚本，输出内容和检测时长由 Check.Place 决定；只有在信任该来源时才运行。`bash` 和 `curl` 会由安装器在缺少时补齐，已有依赖不会重复安装。
 
 ## TLS 证书与 Reality
 

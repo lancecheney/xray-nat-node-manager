@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Keep this in sync with VERSION in node_manager.py.
-MANAGER_VERSION="0.7.9"
+MANAGER_VERSION="0.8.0"
 update_requested=false
 if [ "${1:-}" = "--update" ]; then
   update_requested=true
@@ -26,7 +26,9 @@ installed_manager_version() {
 }
 
 dependencies_ready() {
-  command -v python3 >/dev/null 2>&1 \
+  command -v bash >/dev/null 2>&1 \
+    && command -v curl >/dev/null 2>&1 \
+    && command -v python3 >/dev/null 2>&1 \
     && command -v openssl >/dev/null 2>&1 \
     && command -v socat >/dev/null 2>&1 \
     && (command -v crond >/dev/null 2>&1 || command -v cron >/dev/null 2>&1) \
@@ -42,12 +44,12 @@ install_dependencies() {
   . /etc/os-release
   case "${ID:-}" in
     alpine)
-      apk add --no-cache python3 openssl ca-certificates dcron socat
+      apk add --no-cache bash curl python3 openssl ca-certificates dcron socat
       ;;
     debian|ubuntu)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
-      apt-get install -y --no-install-recommends python3 openssl ca-certificates cron socat
+      apt-get install -y --no-install-recommends bash curl python3 openssl ca-certificates cron socat
       apt-get clean
       rm -rf /var/lib/apt/lists/*
       ;;

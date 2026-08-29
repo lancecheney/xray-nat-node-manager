@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.9"
+VERSION = "0.8.0"
 XRAY_VERSION = "26.7.28"
 NEXTTRACE_VERSION = "1.7.3"
 ACME_VERSION = "3.1.4"
@@ -1006,6 +1006,26 @@ def run_route_trace(binary: Path, target: str) -> dict:
     if not isinstance(payload, dict):
         raise InstallError("NextTrace 返回格式异常")
     return payload
+
+
+def run_ip_quality_test() -> None:
+    if shutil.which("bash") is None:
+        raise InstallError("缺少 bash；请先安装 bash 后重试")
+    if shutil.which("curl") is None:
+        raise InstallError("缺少 curl；请先安装 curl 后重试")
+    print("\n正在运行 IP 质量测试（Check.Place），输出由远程检测脚本提供：")
+    try:
+        result = subprocess.run(
+            ["bash", "-c", "bash <(curl -sL https://Check.Place) -I"],
+            check=False,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InstallError("IP 质量测试超时") from exc
+    except OSError as exc:
+        raise InstallError(f"IP 质量测试无法启动：{exc}") from exc
+    if result.returncode != 0:
+        raise InstallError(f"IP 质量测试失败，退出码：{result.returncode}")
 
 
 def summarize_route_trace(carrier: str | None, payload: dict) -> dict[str, str]:
@@ -2563,6 +2583,7 @@ def menu() -> None:
         "5": ("设置 Agent", configure_agent),
         "6": ("查看 Agent 接入信息（包含敏感凭据）", print_agent_setup),
         "7": ("单节点三网线路/延迟测试", test_single_province_route),
+        "8": ("IP 质量测试（Check.Place）", run_ip_quality_test),
     }
     while True:
         print(f"\nXray NAT 节点管理器 v{VERSION}")

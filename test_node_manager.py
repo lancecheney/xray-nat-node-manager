@@ -492,6 +492,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("3. 查看节点连接", rendered)
         self.assertIn("5. 设置 Agent", rendered)
         self.assertIn("6. 查看 Agent 接入信息", rendered)
+        self.assertIn("8. IP 质量测试（Check.Place）", rendered)
 
     def test_acme_modes_match_identity_type(self):
         cloudflare = nm.acme_validation_args("node.example.com", {"method": "cloudflare"})
@@ -901,6 +902,22 @@ class ProvinceRouteTests(unittest.TestCase):
                 "-m", "25", "-n", "--json", "--no-color", "target.example",
             ],
         )
+
+    def test_ip_quality_test_runs_the_fixed_check_place_command(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(nm.shutil, "which", return_value="/usr/bin/tool"), \
+                mock.patch.object(nm.subprocess, "run", return_value=completed) as run_command:
+            nm.run_ip_quality_test()
+        run_command.assert_called_once_with(
+            ["bash", "-c", "bash <(curl -sL https://Check.Place) -I"],
+            check=False,
+            timeout=300,
+        )
+
+    def test_ip_quality_test_requires_bash_and_curl(self):
+        with mock.patch.object(nm.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(nm.InstallError, "缺少 bash"):
+                nm.run_ip_quality_test()
 
     def test_route_summary_names_line_and_destination_latency(self):
         payload = {
