@@ -929,6 +929,22 @@ class ProvinceRouteTests(unittest.TestCase):
         self.assertEqual(summary["line"], "上海省网")
         self.assertIn("中国联通上海", summary["name"])
 
+    def test_unicom_path_reports_china_telecom_transit_as_borrowed(self):
+        payload = {
+            "Hops": [
+                [self.hop("203.174.80.37", 49, "4809", "新加坡", "Singapore")],
+                [self.hop("69.194.165.5", 40, "4809", "中国", "China", "香港")],
+                [self.hop("203.22.178.82", 65, "4809", "中国", "China", "上海")],
+                [self.hop("219.158.38.241", 66, "4837", "中国", "China", "上海")],
+                [self.hop("60.12.119.66", 68, "4837", "中国", "China", "浙江")],
+            ],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        summary = nm.summarize_route_trace("cu", payload)
+        self.assertIn("借道", summary["transit"])
+        self.assertIn("中国电信", summary["transit"])
+        self.assertIn("AS4809", summary["transit"])
+
     def test_singapore_to_hong_kong_to_shanghai_is_regional_transit(self):
         hops = [
             self.hop("203.174.80.37", 7.5, "4809", "新加坡", "Singapore"),

@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 XRAY_VERSION = "26.7.28"
 NEXTTRACE_VERSION = "1.7.3"
 ACME_VERSION = "3.1.4"
@@ -119,6 +119,7 @@ ROUTE_CARRIERS = (
     ("cu", "中国联通"),
     ("cm", "中国移动"),
 )
+ROUTE_CARRIER_LABELS = dict(ROUTE_CARRIERS)
 ROUTE_LINES = {
     "ct": (
         ("4809", "CN2", "China Telecom Next Generation"),
@@ -748,6 +749,15 @@ def trace_hop_asns(hop: dict) -> list[str]:
     return result
 
 
+def trace_path_asns(hops: list[dict]) -> list[str]:
+    path = []
+    for hop in hops:
+        for asn in trace_hop_asns(hop):
+            if not path or path[-1] != asn:
+                path.append(asn)
+    return path
+
+
 def successful_trace_hops(payload: dict) -> list[dict]:
     groups = payload.get("Hops") or payload.get("hops") or []
     result = []
@@ -761,11 +771,7 @@ def successful_trace_hops(payload: dict) -> list[dict]:
 
 
 def route_line(carrier: str, hops: list[dict]) -> tuple[str, str, str]:
-    path = []
-    for hop in hops:
-        for asn in trace_hop_asns(hop):
-            if not path or path[-1] != asn:
-                path.append(asn)
+    path = trace_path_asns(hops)
     matches = [line for line in ROUTE_LINES[carrier] if line[0] in path]
     if not matches:
         return "未识别", "未看到该运营商的典型骨干 ASN", " → ".join(f"AS{item}" for item in path) or "无公开 ASN"
@@ -775,11 +781,7 @@ def route_line(carrier: str, hops: list[dict]) -> tuple[str, str, str]:
 
 
 def route_line_any(hops: list[dict]) -> tuple[str, str, str]:
-    path = []
-    for hop in hops:
-        for asn in trace_hop_asns(hop):
-            if not path or path[-1] != asn:
-                path.append(asn)
+    path = trace_path_asns(hops)
     matches = []
     for carrier, label in ROUTE_CARRIERS:
         for asn, code, name in ROUTE_LINES[carrier]:
@@ -793,6 +795,44 @@ def route_line_any(hops: list[dict]) -> tuple[str, str, str]:
         " + ".join(item[1] for item in matches),
         as_path,
     )
+
+
+def asn_line_metadata(asn: str) -> tuple[str, str, str] | None:
+    for carrier, label in ROUTE_CARRIERS:
+        for known_asn, code, name in ROUTE_LINES[carrier]:
+            if known_asn == asn:
+                return carrier, code, name
+    return None
+
+
+def format_asn_line(asn: str, metadata: tuple[str, str, str] | None = None) -> str:
+    metadata = metadata or asn_line_metadata(asn)
+    if not metadata:
+        return f"AS{asn}"
+    carrier, code, _ = metadata
+    return f"{ROUTE_CARRIER_LABELS[carrier]} {code}（AS{asn}）"
+
+
+def route_transit(carrier: str, hops: list[dict]) -> str:
+    path = trace_path_asns(hops)
+    target_asns = {item[0] for item in ROUTE_LINES[carrier]}
+    target_positions = [index for index, asn in enumerate(path) if asn in target_asns]
+    if not target_positions:
+        return "未能确认目标运营商 ASN，无法判定借道"
+    # 以目标运营商最后一个已识别 ASN 为边界，避免目标网内出现跨网回程时
+    # 把中途的其他运营商 ASN 静默掉。
+    last_target = max(target_positions)
+    seen = []
+    for asn in path[:last_target]:
+        metadata = asn_line_metadata(asn)
+        if metadata and metadata[0] != carrier and asn not in seen:
+            seen.append(asn)
+    if not seen:
+        return "未发现跨运营商借道证据"
+    target_asn = path[last_target]
+    target_label = format_asn_line(target_asn)
+    borrowed = [format_asn_line(asn) for asn in seen]
+    return f"检测到借道：{'、'.join(borrowed)} → {target_label}"
 
 
 def normalized_hop_location(hop: dict) -> tuple[str, str] | None:
@@ -915,14 +955,27 @@ def summarize_route_trace(carrier: str | None, payload: dict) -> dict[str, str]:
             route_detour(hops, destination[0])
             if destination else "无法判断（目标地理位置不可用或未到达）"
         )
+        destination_carrier = None
+        if hops:
+            for last_asn in reversed(trace_hop_asns(hops[-1])):
+                metadata = asn_line_metadata(last_asn)
+                if metadata:
+                    destination_carrier = metadata[0]
+                    break
+        transit = (
+            route_transit(destination_carrier, hops)
+            if destination_carrier else "自定义 IP 未能确认目标运营商，无法判定借道"
+        )
     else:
         detour = route_detour(hops)
+        transit = route_transit(carrier, hops)
     return {
         "line": line,
         "name": name,
         "as_path": as_path,
         "latency": latency_label,
         "detour": detour,
+        "transit": transit,
     }
 
 
@@ -946,6 +999,7 @@ def test_single_province_route() -> None:
             print(f"  延迟：{summary['latency']}")
             print(f"  路径：{summary['as_path']}")
             print(f"  绕路：{summary['detour']}")
+            print(f"  借道：{summary['transit']}")
         except (InstallError, OSError, subprocess.SubprocessError) as exc:
             print(f"\n{label}  测试失败：{exc}")
 
