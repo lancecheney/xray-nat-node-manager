@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Keep this in sync with VERSION in node_manager.py.
-MANAGER_VERSION="0.7.6"
+MANAGER_VERSION="0.7.7"
 update_requested=false
 if [ "${1:-}" = "--update" ]; then
   update_requested=true
@@ -33,12 +33,39 @@ dependencies_ready() {
     && [ -r /etc/ssl/certs/ca-certificates.crt ]
 }
 
+install_dependencies() {
+  if [ ! -r /etc/os-release ]; then
+    echo "无法识别系统：缺少 /etc/os-release" >&2
+    exit 1
+  fi
+
+  . /etc/os-release
+  case "${ID:-}" in
+    alpine)
+      apk add --no-cache python3 openssl ca-certificates dcron socat
+      ;;
+    debian|ubuntu)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends python3 openssl ca-certificates cron socat
+      apt-get clean
+      rm -rf /var/lib/apt/lists/*
+      ;;
+    *)
+      echo "仅支持 Alpine、Debian、Ubuntu；当前：${ID:-unknown}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 if [ "$update_requested" = false ] \
     && [ -x /usr/local/sbin/node-manager ] \
     && [ -f "$installed_manager" ] \
     && [ -d "$install_dir/assets" ] \
-    && [ "$(installed_manager_version)" = "$MANAGER_VERSION" ] \
-    && dependencies_ready; then
+    && [ "$(installed_manager_version)" = "$MANAGER_VERSION" ]; then
+  if ! dependencies_ready; then
+    install_dependencies
+  fi
   exec /usr/local/sbin/node-manager
 fi
 
@@ -61,29 +88,6 @@ if [ ! -f "$base_dir/node_manager.py" ] || [ ! -d "$base_dir/assets" ]; then
   exit
 fi
 
-if [ ! -r /etc/os-release ]; then
-  echo "无法识别系统：缺少 /etc/os-release" >&2
-  exit 1
-fi
-
-. /etc/os-release
-case "${ID:-}" in
-  alpine)
-    apk add --no-cache python3 openssl ca-certificates dcron socat
-    ;;
-  debian|ubuntu)
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends python3 openssl ca-certificates cron socat
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-    ;;
-  *)
-    echo "仅支持 Alpine、Debian、Ubuntu；当前：${ID:-unknown}" >&2
-    exit 1
-    ;;
-esac
-
 install -d -m 0755 "$install_dir/assets"
 install -m 0755 "$base_dir/node_manager.py" "$installed_manager"
 
@@ -91,6 +95,10 @@ for asset in "$base_dir"/assets/xui-agent-linux-*; do
   [ -f "$asset" ] || continue
   install -m 0755 "$asset" "$install_dir/assets/$(basename "$asset")"
 done
+
+if ! dependencies_ready; then
+  install_dependencies
+fi
 
 ln -sf /usr/local/lib/xray-nat-node-manager/node_manager.py /usr/local/sbin/node-manager
 echo "安装完成，正在启动 node-manager"
