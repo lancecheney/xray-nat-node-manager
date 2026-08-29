@@ -31,8 +31,9 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.6.5"
+VERSION = "0.7.0"
 XRAY_VERSION = "26.7.28"
+NEXTTRACE_VERSION = "1.7.3"
 ACME_VERSION = "3.1.4"
 ACME_ARCHIVE_SHA256 = "e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
 ROOT = Path("/etc/xray-nat-node-manager")
@@ -42,6 +43,7 @@ AGENT_CONFIG = Path("/etc/xui-agent/config.json")
 AGENT_STATE = Path("/var/lib/xui-agent/state.json")
 AGENT_BINARY = Path("/usr/local/sbin/xui-agent")
 XRAY_BINARY = Path("/usr/local/bin/xray")
+NEXTTRACE_BINARY = Path("/usr/local/bin/nexttrace")
 BACKUP_ROOT = Path("/var/backups/xray-nat-node-manager")
 ACME_HOME = Path("/opt/acme.sh")
 ACME_CONFIG_HOME = Path("/etc/acme.sh")
@@ -102,6 +104,44 @@ REALITY_DOMAIN_BLOCKLIST = (
 REALITY_SUSPICIOUS_LABELS = (
     "proxy", "vpn", "vless", "xray", "hysteria", "hy2", "trojan",
 )
+
+PROVINCE_ROUTE_CODES = {
+    "北京": "bj", "天津": "tj", "河北": "he", "山西": "sx", "内蒙古": "nm",
+    "辽宁": "ln", "吉林": "jl", "黑龙江": "hl", "上海": "sh", "江苏": "js",
+    "浙江": "zj", "安徽": "ah", "福建": "fj", "江西": "jx", "山东": "sd",
+    "河南": "ha", "湖北": "hb", "湖南": "hn", "广东": "gd", "广西": "gx",
+    "海南": "hi", "重庆": "cq", "四川": "sc", "贵州": "gz", "云南": "yn",
+    "西藏": "xz", "陕西": "sn", "甘肃": "gs", "青海": "qh", "宁夏": "nx",
+    "新疆": "xj",
+}
+ROUTE_CARRIERS = (
+    ("ct", "中国电信"),
+    ("cu", "中国联通"),
+    ("cm", "中国移动"),
+)
+ROUTE_LINES = {
+    "ct": (
+        ("4809", "CN2", "China Telecom Next Generation"),
+        ("4134", "163", "ChinaNet 骨干网"),
+    ),
+    "cu": (
+        ("9929", "9929", "中国联通精品网"),
+        ("10099", "CUG", "China Unicom Global"),
+        ("4837", "4837/169", "China Unicom 169 骨干网"),
+    ),
+    "cm": (
+        ("58807", "CMIN2", "China Mobile International N2"),
+        ("58453", "CMI", "China Mobile International"),
+        ("9808", "CMNET", "中国移动骨干网"),
+    ),
+}
+UNKNOWN_GEO_LABELS = {
+    "", "unknown", "未知", "网络故障", "network error", "anycast",
+}
+NEXTTRACE_SHA256 = {
+    "nexttrace-tiny_linux_amd64": "52b4a69aa2108332f53ca2e73ffdb2937cb6cf80a6f1730765fe2209ca720f7d",
+    "nexttrace-tiny_linux_arm64": "10c8a06c9f516b737c82a2c7ce6571e3a1165bf420805b508f384af277f31147",
+}
 
 
 class InstallError(RuntimeError):
@@ -547,6 +587,268 @@ def download_xray(version: str, destination: Path) -> None:
             with package.open(member) as source, destination.open("wb") as output:
                 shutil.copyfileobj(source, output, 1024 * 1024)
     os.chmod(destination, 0o755)
+
+
+def nexttrace_asset_name() -> str:
+    machine = platform.machine().lower()
+    mapping = {
+        "x86_64": "amd64", "amd64": "amd64",
+        "aarch64": "arm64", "arm64": "arm64",
+    }
+    if machine not in mapping:
+        raise InstallError(f"NextTrace 不支持的 CPU 架构：{machine}")
+    return f"nexttrace-tiny_linux_{mapping[machine]}"
+
+
+def download_nexttrace(destination: Path) -> None:
+    name = nexttrace_asset_name()
+    expected = NEXTTRACE_SHA256[name]
+    url = (
+        "https://github.com/nxtrace/NTrace-core/releases/download/"
+        f"v{NEXTTRACE_VERSION}/{name}"
+    )
+    digest = hashlib.sha256()
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"xray-nat-node-manager/{VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        with destination.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+    if digest.hexdigest() != expected:
+        destination.unlink(missing_ok=True)
+        raise InstallError("NextTrace 下载文件 SHA-256 不匹配")
+    os.chmod(destination, 0o755)
+
+
+def ensure_nexttrace() -> Path:
+    existing = shutil.which("nexttrace")
+    if existing:
+        return Path(existing)
+    if os.geteuid() != 0:
+        raise InstallError("未安装 NextTrace；请使用 root 运行以自动安装官方 tiny 版")
+    print("未检测到 NextTrace，正在安装官方 tiny 版（校验 SHA-256）...")
+    fd, candidate_name = tempfile.mkstemp(prefix="nexttrace-", dir="/tmp")
+    os.close(fd)
+    candidate = Path(candidate_name)
+    try:
+        download_nexttrace(candidate)
+        copy_atomic(candidate, NEXTTRACE_BINARY, 0o755)
+    finally:
+        candidate.unlink(missing_ok=True)
+    print(f"NextTrace 已安装：{NEXTTRACE_BINARY}")
+    return NEXTTRACE_BINARY
+
+
+def province_route_targets(value: str) -> list[tuple[str, str, str]]:
+    province = value.strip()
+    code = PROVINCE_ROUTE_CODES.get(province)
+    if code is None:
+        raise InstallError(
+            "省份/直辖市不匹配；请严格输入以下名称之一：\n"
+            + "、".join(PROVINCE_ROUTE_CODES)
+        )
+    return [
+        (carrier, label, f"{code}-{carrier}-v4.ip.zstaticcdn.com")
+        for carrier, label in ROUTE_CARRIERS
+    ]
+
+
+def trace_rtt_ms(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Go 的 time.Duration 在 JSON 中以纳秒整数输出。
+        return float(value) / 1_000_000
+    if isinstance(value, str):
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(ns|us|µs|ms|s)?", value)
+        if not match:
+            return None
+        number = float(match.group(1))
+        return number * {"ns": 0.000001, "us": 0.001, "µs": 0.001, "ms": 1, "s": 1000}.get(
+            match.group(2) or "ms", 1,
+        )
+    return None
+
+
+def trace_hop_ip(hop: dict) -> str | None:
+    address = hop.get("Address") or hop.get("address")
+    if isinstance(address, str):
+        value = address.rsplit(":", 1)[0] if address.count(":") == 1 else address
+    elif isinstance(address, dict):
+        value = address.get("IP") or address.get("ip")
+    else:
+        value = None
+    if not value:
+        geo = hop.get("Geo") or hop.get("geo") or {}
+        value = geo.get("ip") if isinstance(geo, dict) else None
+    try:
+        return str(ipaddress.ip_address(str(value)))
+    except ValueError:
+        return None
+
+
+def trace_hop_geo(hop: dict) -> dict:
+    geo = hop.get("Geo") or hop.get("geo") or {}
+    return geo if isinstance(geo, dict) else {}
+
+
+def trace_hop_asn(hop: dict) -> str | None:
+    value = trace_hop_geo(hop).get("asnumber")
+    if value is None:
+        return None
+    match = re.search(r"\d+", str(value))
+    return match.group(0) if match else None
+
+
+def successful_trace_hops(payload: dict) -> list[dict]:
+    groups = payload.get("Hops") or payload.get("hops") or []
+    result = []
+    for group in groups:
+        candidates = group if isinstance(group, list) else [group]
+        usable = [hop for hop in candidates if isinstance(hop, dict) and hop.get("Success", hop.get("success", True))]
+        if not usable:
+            continue
+        result.append(min(usable, key=lambda hop: trace_rtt_ms(hop.get("RTT", hop.get("rtt"))) or float("inf")))
+    return result
+
+
+def route_line(carrier: str, hops: list[dict]) -> tuple[str, str, str]:
+    path = []
+    for hop in hops:
+        asn = trace_hop_asn(hop)
+        if asn and (not path or path[-1] != asn):
+            path.append(asn)
+    matches = [line for line in ROUTE_LINES[carrier] if line[0] in path]
+    if not matches:
+        return "未识别", "未看到该运营商的典型骨干 ASN", " → ".join(f"AS{item}" for item in path) or "无公开 ASN"
+    code = "+".join(item[1] for item in matches)
+    name = " + ".join(item[2] for item in matches)
+    return code, name, " → ".join(f"AS{item}" for item in path)
+
+
+def normalized_hop_location(hop: dict) -> tuple[str, str] | None:
+    geo = trace_hop_geo(hop)
+    country_en = str(geo.get("country_en") or "").strip()
+    country = str(geo.get("country") or country_en).strip()
+    if country.lower() in UNKNOWN_GEO_LABELS and country_en.lower() in UNKNOWN_GEO_LABELS:
+        return None
+    province = str(geo.get("prov") or geo.get("prov_en") or "").strip()
+    combined = re.sub(r"[\s_-]+", "", f"{country_en}{country}{province}").lower()
+    special = (
+        (("hongkong", "香港"), "HK", "香港"),
+        (("macao", "macau", "澳门"), "MO", "澳门"),
+        (("taiwan", "台湾"), "TW", "台湾"),
+    )
+    for needles, key, label in special:
+        if any(needle in combined for needle in needles):
+            return key, label
+    if country_en.lower() in {"cn", "china", "mainland china"} or country in {"中国", "中国大陆"}:
+        return "CN", "中国大陆"
+    key = country_en.casefold() or country.casefold()
+    return key, country or country_en
+
+
+def route_detour(hops: list[dict]) -> str:
+    located = []
+    for hop in hops:
+        address = trace_hop_ip(hop)
+        if address is None or not ipaddress.ip_address(address).is_global:
+            continue
+        location = normalized_hop_location(hop)
+        rtt = trace_rtt_ms(hop.get("RTT", hop.get("rtt")))
+        if location and rtt is not None:
+            located.append((location[0], location[1], rtt))
+    if len(located) < 2:
+        return "无法判断（公开地理跳点不足）"
+
+    prefix = located[:5]
+    # 起点附近通常 RTT 最低；用它比“首个 GeoIP 标签”更能抵抗首跳误标。
+    source_key = min(prefix, key=lambda item: item[2])[0]
+    source_rtt = min(item[2] for item in located if item[0] == source_key)
+    candidates: dict[str, list[tuple[str, float, int]]] = {}
+    for index, (key, label, rtt) in enumerate(located):
+        if key not in {source_key, "CN"}:
+            candidates.setdefault(key, []).append((label, rtt, index))
+
+    credible = []
+    ignored = 0
+    for samples in candidates.values():
+        minimum = min(item[1] for item in samples)
+        enough_latency = minimum >= 10 and minimum - source_rtt >= 8
+        nearby_pair = any(
+            right[2] - left[2] <= 2
+            for left, right in zip(samples, samples[1:])
+        )
+        if len(samples) >= 2 and nearby_pair and enough_latency:
+            credible.append((samples[0][0], minimum, len(samples)))
+        else:
+            ignored += len(samples)
+    if credible:
+        detail = "、".join(f"{label}（{count} 跳，最低 {rtt:.1f} ms）" for label, rtt, count in credible)
+        return f"疑似绕路：经 {detail}；请结合完整路由复核"
+    suffix = f"；已忽略 {ignored} 个孤立或低 RTT 的 GeoIP 标签" if ignored else ""
+    return f"未发现可信绕路证据{suffix}"
+
+
+def run_route_trace(binary: Path, target: str) -> dict:
+    argv = [
+        str(binary), "-4", "-q", "1", "--parallel-requests", "1",
+        "-m", "25", "-n", "--json", "--no-color", target,
+    ]
+    try:
+        result = subprocess.run(
+            argv, check=False, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=50,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InstallError(f"NextTrace 测试超时：{target}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"退出码 {result.returncode}"
+        raise InstallError(f"NextTrace 测试失败：{detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise InstallError("NextTrace 未返回有效 JSON；请更新 NextTrace 后重试") from exc
+    if not isinstance(payload, dict):
+        raise InstallError("NextTrace 返回格式异常")
+    return payload
+
+
+def summarize_route_trace(carrier: str, payload: dict) -> dict[str, str]:
+    hops = successful_trace_hops(payload)
+    line, name, as_path = route_line(carrier, hops)
+    latency = trace_rtt_ms(hops[-1].get("RTT", hops[-1].get("rtt"))) if hops else None
+    reason = ((payload.get("StopReason") or payload.get("stop_reason") or {}).get("reason") or "")
+    latency_label = f"{latency:.1f} ms" if latency is not None else "无响应"
+    if latency is not None and reason and reason != "destination_reached":
+        latency_label += "（最后响应跳）"
+    return {
+        "line": line,
+        "name": name,
+        "as_path": as_path,
+        "latency": latency_label,
+        "detour": route_detour(hops),
+    }
+
+
+def test_single_province_route() -> None:
+    print("\n单节点三网线路/延迟测试（IPv4）")
+    print("严格匹配示例：浙江、上海、北京；不做模糊纠错。")
+    province = prompt("省份/直辖市/自治区简称")
+    targets = province_route_targets(province)
+    binary = ensure_nexttrace()
+    print(f"\n正在测试 {province.strip()} 电信、联通、移动；每跳仅 1 次探测，请稍候...")
+    print("GeoIP 仅作辅助；绕路结论会忽略孤立或不符合 RTT 的离谱标签。")
+    for carrier, label, target in targets:
+        try:
+            summary = summarize_route_trace(carrier, run_route_trace(binary, target))
+            print(f"\n{label}  目标：{target}")
+            print(f"  线路：{summary['line']}｜{summary['name']}")
+            print(f"  延迟：{summary['latency']}")
+            print(f"  路径：{summary['as_path']}")
+            print(f"  绕路：{summary['detour']}")
+        except (InstallError, OSError, subprocess.SubprocessError) as exc:
+            print(f"\n{label}  测试失败：{exc}")
 
 
 def quic_settings() -> dict:
@@ -1984,6 +2286,7 @@ def menu() -> None:
         "4": ("查看服务状态/端口映射", show_status_and_mapping),
         "5": ("设置 Agent", configure_agent),
         "6": ("查看 Agent 接入信息（包含敏感凭据）", print_agent_setup),
+        "7": ("单节点三网线路/延迟测试", test_single_province_route),
     }
     while True:
         print(f"\nXray NAT 节点管理器 v{VERSION}")

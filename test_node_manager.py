@@ -1,5 +1,6 @@
 import io
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -808,6 +809,125 @@ class ConfigTests(unittest.TestCase):
                 {"type": "field", "inboundTag": [spec["tag"]], "outboundTag": "direct"},
                 rules,
             )
+
+
+class ProvinceRouteTests(unittest.TestCase):
+    @staticmethod
+    def hop(ip, rtt_ms, asn, country, country_en, province=""):
+        return {
+            "Success": True,
+            "Address": {"IP": ip, "Zone": ""},
+            "RTT": int(rtt_ms * 1_000_000),
+            "Geo": {
+                "ip": ip,
+                "asnumber": asn,
+                "country": country,
+                "country_en": country_en,
+                "prov": province,
+            },
+        }
+
+    def test_province_name_is_strict_and_builds_three_targets(self):
+        self.assertEqual(
+            nm.province_route_targets("浙江"),
+            [
+                ("ct", "中国电信", "zj-ct-v4.ip.zstaticcdn.com"),
+                ("cu", "中国联通", "zj-cu-v4.ip.zstaticcdn.com"),
+                ("cm", "中国移动", "zj-cm-v4.ip.zstaticcdn.com"),
+            ],
+        )
+        with self.assertRaisesRegex(nm.InstallError, "不匹配"):
+            nm.province_route_targets("浙江省")
+        with self.assertRaisesRegex(nm.InstallError, "不匹配"):
+            nm.province_route_targets("浙汪")
+
+    def test_nexttrace_download_uses_pinned_asset_and_hash(self):
+        binary = b"official nexttrace fixture"
+        expected = hashlib.sha256(binary).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "nexttrace"
+            with mock.patch.object(nm.platform, "machine", return_value="x86_64"), \
+                    mock.patch.dict(
+                        nm.NEXTTRACE_SHA256,
+                        {"nexttrace-tiny_linux_amd64": expected},
+                    ), \
+                    mock.patch.object(
+                        nm.urllib.request, "urlopen", return_value=io.BytesIO(binary),
+                    ) as urlopen:
+                nm.download_nexttrace(destination)
+            self.assertEqual(destination.read_bytes(), binary)
+            request = urlopen.call_args.args[0]
+            self.assertIn(
+                f"/v{nm.NEXTTRACE_VERSION}/nexttrace-tiny_linux_amd64",
+                request.full_url,
+            )
+
+    def test_nexttrace_command_uses_requested_lightweight_profile(self):
+        payload = {"Hops": [], "StopReason": {"reason": "max_hops"}}
+        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
+        with mock.patch.object(nm.subprocess, "run", return_value=completed) as run_command:
+            self.assertEqual(nm.run_route_trace(Path("/bin/nexttrace"), "target.example"), payload)
+        self.assertEqual(
+            run_command.call_args.args[0],
+            [
+                "/bin/nexttrace", "-4", "-q", "1", "--parallel-requests", "1",
+                "-m", "25", "-n", "--json", "--no-color", "target.example",
+            ],
+        )
+
+    def test_route_summary_names_line_and_destination_latency(self):
+        payload = {
+            "Hops": [
+                [self.hop("8.8.8.8", 2, "64500", "香港", "Hong Kong", "香港")],
+                [self.hop("59.43.1.1", 12.5, "4809", "中国", "China", "上海")],
+                [self.hop("202.96.1.1", 18.2, "4134", "中国", "China", "浙江")],
+            ],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        summary = nm.summarize_route_trace("ct", payload)
+        self.assertEqual(summary["line"], "CN2+163")
+        self.assertIn("China Telecom Next Generation", summary["name"])
+        self.assertEqual(summary["latency"], "18.2 ms")
+        self.assertEqual(summary["as_path"], "AS64500 → AS4809 → AS4134")
+
+    def test_implausible_single_geoip_hop_is_not_called_a_detour(self):
+        hops = [
+            self.hop("8.8.8.1", 0.6, "64500", "香港", "Hong Kong", "香港"),
+            self.hop("8.8.8.2", 0.9, "64500", "香港", "Hong Kong", "香港"),
+            self.hop("8.8.4.4", 1.0, "64501", "英国", "United Kingdom"),
+            self.hop("202.97.1.1", 9.0, "4134", "中国", "China", "上海"),
+        ]
+        result = nm.route_detour(hops)
+        self.assertIn("未发现可信绕路证据", result)
+        self.assertIn("已忽略 1 个", result)
+        self.assertNotIn("疑似绕路", result)
+
+    def test_two_plausible_foreign_hops_are_reported_as_suspected_detour(self):
+        hops = [
+            self.hop("8.8.8.1", 1.0, "64500", "香港", "Hong Kong", "香港"),
+            self.hop("8.8.8.2", 1.5, "64500", "香港", "Hong Kong", "香港"),
+            self.hop("1.1.1.1", 35.0, "2914", "日本", "Japan"),
+            self.hop("1.0.0.1", 39.0, "2914", "日本", "Japan"),
+            self.hop("202.97.1.1", 51.0, "4134", "中国", "China", "上海"),
+        ]
+        result = nm.route_detour(hops)
+        self.assertIn("疑似绕路：经 日本", result)
+        self.assertIn("2 跳", result)
+
+    def test_menu_action_prints_all_three_carriers(self):
+        payload = {
+            "Hops": [[self.hop("202.97.1.1", 20, "4134", "中国", "China", "浙江")]],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        output = io.StringIO()
+        with mock.patch("builtins.input", return_value="浙江"), \
+                mock.patch.object(nm, "ensure_nexttrace", return_value=Path("/bin/nexttrace")), \
+                mock.patch.object(nm, "run_route_trace", return_value=payload), \
+                redirect_stdout(output):
+            nm.test_single_province_route()
+        rendered = output.getvalue()
+        for carrier in ("中国电信", "中国联通", "中国移动"):
+            self.assertIn(carrier, rendered)
 
 
 if __name__ == "__main__":
