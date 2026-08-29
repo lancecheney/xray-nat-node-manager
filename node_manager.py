@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 XRAY_VERSION = "26.7.28"
 NEXTTRACE_VERSION = "1.7.3"
 ACME_VERSION = "3.1.4"
@@ -655,6 +655,17 @@ def province_route_targets(value: str) -> list[tuple[str, str, str]]:
     ]
 
 
+def route_test_targets(value: str) -> list[tuple[str | None, str, str]]:
+    target = value.strip()
+    try:
+        address = ipaddress.ip_address(target)
+    except ValueError:
+        return province_route_targets(target)
+    if address.version != 4:
+        raise InstallError("当前轻量测试仅支持 IPv4")
+    return [(None, "自定义 IP", str(address))]
+
+
 def trace_rtt_ms(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         # Go 的 time.Duration 在 JSON 中以纳秒整数输出。
@@ -726,6 +737,27 @@ def route_line(carrier: str, hops: list[dict]) -> tuple[str, str, str]:
     return code, name, " → ".join(f"AS{item}" for item in path)
 
 
+def route_line_any(hops: list[dict]) -> tuple[str, str, str]:
+    path = []
+    for hop in hops:
+        asn = trace_hop_asn(hop)
+        if asn and (not path or path[-1] != asn):
+            path.append(asn)
+    matches = []
+    for carrier, label in ROUTE_CARRIERS:
+        for asn, code, name in ROUTE_LINES[carrier]:
+            if asn in path:
+                matches.append((code, f"{label} {name}"))
+    as_path = " → ".join(f"AS{item}" for item in path) or "无公开 ASN"
+    if not matches:
+        return "未识别", "未看到典型三网骨干 ASN", as_path
+    return (
+        "+".join(item[0] for item in matches),
+        " + ".join(item[1] for item in matches),
+        as_path,
+    )
+
+
 def normalized_hop_location(hop: dict) -> tuple[str, str] | None:
     geo = trace_hop_geo(hop)
     country_en = str(geo.get("country_en") or "").strip()
@@ -748,7 +780,7 @@ def normalized_hop_location(hop: dict) -> tuple[str, str] | None:
     return key, country or country_en
 
 
-def route_detour(hops: list[dict]) -> str:
+def route_detour(hops: list[dict], destination_key: str = "CN") -> str:
     located = []
     for hop in hops:
         address = trace_hop_ip(hop)
@@ -767,7 +799,7 @@ def route_detour(hops: list[dict]) -> str:
     source_rtt = min(item[2] for item in located if item[0] == source_key)
     candidates: dict[str, list[tuple[str, float, int]]] = {}
     for index, (key, label, rtt) in enumerate(located):
-        if key not in {source_key, "CN"}:
+        if key not in {source_key, destination_key}:
             candidates.setdefault(key, []).append((label, rtt, index))
 
     credible = []
@@ -814,30 +846,45 @@ def run_route_trace(binary: Path, target: str) -> dict:
     return payload
 
 
-def summarize_route_trace(carrier: str, payload: dict) -> dict[str, str]:
+def summarize_route_trace(carrier: str | None, payload: dict) -> dict[str, str]:
     hops = successful_trace_hops(payload)
-    line, name, as_path = route_line(carrier, hops)
+    if carrier is None:
+        line, name, as_path = route_line_any(hops)
+    else:
+        line, name, as_path = route_line(carrier, hops)
     latency = trace_rtt_ms(hops[-1].get("RTT", hops[-1].get("rtt"))) if hops else None
     reason = ((payload.get("StopReason") or payload.get("stop_reason") or {}).get("reason") or "")
     latency_label = f"{latency:.1f} ms" if latency is not None else "无响应"
     if latency is not None and reason and reason != "destination_reached":
         latency_label += "（最后响应跳）"
+    if carrier is None:
+        destination = normalized_hop_location(hops[-1]) if hops and reason == "destination_reached" else None
+        detour = (
+            route_detour(hops, destination[0])
+            if destination else "无法判断（目标地理位置不可用或未到达）"
+        )
+    else:
+        detour = route_detour(hops)
     return {
         "line": line,
         "name": name,
         "as_path": as_path,
         "latency": latency_label,
-        "detour": route_detour(hops),
+        "detour": detour,
     }
 
 
 def test_single_province_route() -> None:
-    print("\n单节点三网线路/延迟测试（IPv4）")
-    print("严格匹配示例：浙江、上海、北京；不做模糊纠错。")
-    province = prompt("省份/直辖市/自治区简称")
-    targets = province_route_targets(province)
+    print("\n单节点线路/延迟测试（IPv4）")
+    print("可输入省级简称（浙江、上海、黑龙江）或直接输入目标 IPv4。")
+    print("中文严格匹配且不带“省/市”；IPv4 不校验归属地或运营商。")
+    value = prompt("省份/直辖市/自治区简称或目标 IPv4")
+    targets = route_test_targets(value)
     binary = ensure_nexttrace()
-    print(f"\n正在测试 {province.strip()} 电信、联通、移动；每跳仅 1 次探测，请稍候...")
+    if targets[0][0] is None:
+        print(f"\n正在直接测试 {targets[0][2]}；每跳仅 1 次探测，请稍候...")
+    else:
+        print(f"\n正在测试 {value.strip()} 电信、联通、移动；每跳仅 1 次探测，请稍候...")
     print("GeoIP 仅作辅助；绕路结论会忽略孤立或不符合 RTT 的离谱标签。")
     for carrier, label, target in targets:
         try:

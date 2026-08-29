@@ -43,7 +43,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lancecheney/xray-nat-node-ma
 
 两条 HY2 当前保持为两个独立 Xray 服务，因此不能共用同一个内部 UDP 端口；若合并成单个入站才可通过不同认证用户共用端口。VLESS Reality 使用 TCP，HY2 使用 UDP，所以二者可以使用相同的端口数字，但 NAT 面板必须分别建立 TCP 与 UDP 映射。
 
-菜单 `7` 是只读的轻量单节点回程测试。严格输入 `浙江`、`上海`、`北京` 这类省级简称后，脚本会依次测试当地中国电信、中国联通和中国移动目标，每跳只发起一次 IPv4 探测，并显示典型线路名称、最后响应延迟、去重后的 AS 路径和保守的疑似绕路判断。省级三网目标使用 [oneclickvirt/nt3 的 31 省级路由注册表](https://github.com/oneclickvirt/nt3/blob/main/model/snapshot/province-routes.json)。首次使用若缺少 NextTrace，脚本会从 [nxtrace/NTrace-core 官方发布](https://github.com/nxtrace/NTrace-core/releases)安装固定版本的 `nexttrace-tiny`，并用仓库内记录的官方发布文件 SHA-256 校验，避免 GitHub API 限流影响安装。
+菜单 `7` 是只读的轻量单节点回程测试。输入 `浙江`、`上海`、`黑龙江` 这类不带“省/市”的省级简称后，脚本会依次测试当地中国电信、中国联通和中国移动目标；中文严格匹配，`浙江省` 或错字不会自动纠正。也可以直接输入一个 IPv4，只对这个地址运行一次测试，适合从中转机检查到落地机的线路；IP 模式不校验地址归属地、运营商或公网/私网属性。两种模式均为每跳一次探测，并显示典型线路名称、最后响应延迟、去重后的 AS 路径和保守的疑似绕路判断。省级三网目标使用 [oneclickvirt/nt3 的 31 省级路由注册表](https://github.com/oneclickvirt/nt3/blob/main/model/snapshot/province-routes.json)。首次使用若缺少 NextTrace，脚本会从 [nxtrace/NTrace-core 官方发布](https://github.com/nxtrace/NTrace-core/releases)安装固定版本的 `nexttrace-tiny`，并用仓库内记录的官方发布文件 SHA-256 校验，避免 GitHub API 限流影响安装。
 
 线路与绕路均是基于可见跳点的推断，不等同于 BGP 或运营商结论。单个 GeoIP 国家标签不会直接判为绕路；只有不同于起点和中国大陆的地区至少出现两个公开跳点，并且 RTT 增幅合理时，才显示“疑似绕路”。例如香港到上海途中偶发一个 `1 ms 英国` 标签，只会作为证据不足的 GeoIP 标签忽略。隐藏路由或公开跳点不足时会明确显示无法判断。
 

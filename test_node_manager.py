@@ -841,6 +841,18 @@ class ProvinceRouteTests(unittest.TestCase):
         with self.assertRaisesRegex(nm.InstallError, "不匹配"):
             nm.province_route_targets("浙汪")
 
+    def test_ipv4_input_bypasses_province_and_public_address_checks(self):
+        self.assertEqual(
+            nm.route_test_targets("203.0.113.9"),
+            [(None, "自定义 IP", "203.0.113.9")],
+        )
+        self.assertEqual(
+            nm.route_test_targets("10.0.0.8"),
+            [(None, "自定义 IP", "10.0.0.8")],
+        )
+        with self.assertRaisesRegex(nm.InstallError, "仅支持 IPv4"):
+            nm.route_test_targets("2001:db8::1")
+
     def test_nexttrace_download_uses_pinned_asset_and_hash(self):
         binary = b"official nexttrace fixture"
         expected = hashlib.sha256(binary).hexdigest()
@@ -890,6 +902,21 @@ class ProvinceRouteTests(unittest.TestCase):
         self.assertEqual(summary["latency"], "18.2 ms")
         self.assertEqual(summary["as_path"], "AS64500 → AS4809 → AS4134")
 
+    def test_custom_ip_summary_recognizes_any_carrier_line(self):
+        payload = {
+            "Hops": [
+                [self.hop("8.8.8.8", 1, "64500", "香港", "Hong Kong", "香港")],
+                [self.hop("59.43.1.1", 15, "4809", "中国", "China", "上海")],
+                [self.hop("203.0.113.9", 22, "4134", "中国", "China", "浙江")],
+            ],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        summary = nm.summarize_route_trace(None, payload)
+        self.assertEqual(summary["line"], "CN2+163")
+        self.assertIn("中国电信", summary["name"])
+        self.assertEqual(summary["latency"], "22.0 ms")
+        self.assertIn("未发现可信绕路证据", summary["detour"])
+
     def test_implausible_single_geoip_hop_is_not_called_a_detour(self):
         hops = [
             self.hop("8.8.8.1", 0.6, "64500", "香港", "Hong Kong", "香港"),
@@ -928,6 +955,22 @@ class ProvinceRouteTests(unittest.TestCase):
         rendered = output.getvalue()
         for carrier in ("中国电信", "中国联通", "中国移动"):
             self.assertIn(carrier, rendered)
+
+    def test_menu_ip_mode_runs_only_the_entered_target(self):
+        payload = {
+            "Hops": [[self.hop("203.0.113.9", 20, "64500", "日本", "Japan")]],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        output = io.StringIO()
+        with mock.patch("builtins.input", return_value="203.0.113.9"), \
+                mock.patch.object(nm, "ensure_nexttrace", return_value=Path("/bin/nexttrace")), \
+                mock.patch.object(nm, "run_route_trace", return_value=payload) as trace, \
+                redirect_stdout(output):
+            nm.test_single_province_route()
+        trace.assert_called_once_with(Path("/bin/nexttrace"), "203.0.113.9")
+        rendered = output.getvalue()
+        self.assertIn("自定义 IP", rendered)
+        self.assertNotIn("中国联通  目标", rendered)
 
 
 if __name__ == "__main__":
