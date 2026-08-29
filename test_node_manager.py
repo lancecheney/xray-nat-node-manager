@@ -853,6 +853,21 @@ class ProvinceRouteTests(unittest.TestCase):
         with self.assertRaisesRegex(nm.InstallError, "仅支持 IPv4"):
             nm.route_test_targets("2001:db8::1")
 
+    def test_route_test_rounds_default_to_one_and_enforce_cap(self):
+        with mock.patch("builtins.input", return_value=""):
+            self.assertEqual(nm.prompt_route_test_rounds(), 1)
+        with mock.patch("builtins.input", return_value=str(nm.MAX_ROUTE_TEST_ROUNDS)):
+            self.assertEqual(nm.prompt_route_test_rounds(), nm.MAX_ROUTE_TEST_ROUNDS)
+        with mock.patch("builtins.input", return_value="0"), \
+                self.assertRaisesRegex(nm.InstallError, "允许 1-5 次"):
+            nm.prompt_route_test_rounds()
+        with mock.patch("builtins.input", return_value=str(nm.MAX_ROUTE_TEST_ROUNDS + 1)), \
+                self.assertRaisesRegex(nm.InstallError, "允许 1-5 次"):
+            nm.prompt_route_test_rounds()
+        with mock.patch("builtins.input", return_value="两次"), \
+                self.assertRaisesRegex(nm.InstallError, "必须是整数"):
+            nm.prompt_route_test_rounds()
+
     def test_nexttrace_download_uses_pinned_asset_and_hash(self):
         binary = b"official nexttrace fixture"
         expected = hashlib.sha256(binary).hexdigest()
@@ -996,6 +1011,31 @@ class ProvinceRouteTests(unittest.TestCase):
         self.assertNotIn("AS9808", summary["as_path"])
         self.assertNotIn("AS56041", summary["as_path"])
 
+    def test_repeated_route_samples_report_median_and_preserve_borrow_marker(self):
+        borrowed = {
+            "Hops": [
+                [self.hop("203.174.80.37", 49, "4809", "新加坡", "Singapore")],
+                [self.hop("219.158.38.241", 66, "4837", "中国", "China", "上海")],
+                [self.hop("60.12.119.66", 30, "4837", "中国", "China", "浙江")],
+            ],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        normal = {
+            "Hops": [[self.hop("60.12.119.66", 10, "4837", "中国", "China", "浙江")]],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        result = nm.summarize_route_samples(
+            "cu",
+            [normal, borrowed, normal],
+            3,
+        )
+        self.assertIn("中位 10.0 ms", result["latency"])
+        self.assertIn("成功 3/3 次", result["latency"])
+        self.assertIn("范围 10.0-30.0 ms", result["latency"])
+        self.assertIn("（借道）", result["line"])
+        single = nm.summarize_route_samples("cu", [normal], 1)
+        self.assertEqual(single["latency"], "10.0 ms")
+
     def test_implausible_single_geoip_hop_is_not_called_a_detour(self):
         hops = [
             self.hop("8.8.8.1", 0.6, "64500", "香港", "Hong Kong", "香港"),
@@ -1026,14 +1066,27 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         output = io.StringIO()
-        with mock.patch("builtins.input", return_value="浙江"), \
+        with mock.patch("builtins.input", side_effect=["浙江", "2"]), \
                 mock.patch.object(nm, "ensure_nexttrace", return_value=Path("/bin/nexttrace")), \
-                mock.patch.object(nm, "run_route_trace", return_value=payload), \
+                mock.patch.object(nm, "run_route_trace", return_value=payload) as trace, \
                 redirect_stdout(output):
             nm.test_single_province_route()
         rendered = output.getvalue()
+        self.assertEqual(trace.call_count, 6)
+        self.assertEqual(
+            trace.call_args_list,
+            [
+                mock.call(Path("/bin/nexttrace"), "zj-ct-v4.ip.zstaticcdn.com"),
+                mock.call(Path("/bin/nexttrace"), "zj-ct-v4.ip.zstaticcdn.com"),
+                mock.call(Path("/bin/nexttrace"), "zj-cu-v4.ip.zstaticcdn.com"),
+                mock.call(Path("/bin/nexttrace"), "zj-cu-v4.ip.zstaticcdn.com"),
+                mock.call(Path("/bin/nexttrace"), "zj-cm-v4.ip.zstaticcdn.com"),
+                mock.call(Path("/bin/nexttrace"), "zj-cm-v4.ip.zstaticcdn.com"),
+            ],
+        )
         for carrier in ("中国电信", "中国联通", "中国移动"):
             self.assertIn(carrier, rendered)
+        self.assertIn("每个目标顺序测试 2 次", rendered)
         self.assertNotIn("借道：", rendered)
 
     def test_menu_ip_mode_runs_only_the_entered_target(self):
@@ -1042,7 +1095,7 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         output = io.StringIO()
-        with mock.patch("builtins.input", return_value="203.0.113.9"), \
+        with mock.patch("builtins.input", side_effect=["203.0.113.9", "1"]), \
                 mock.patch.object(nm, "ensure_nexttrace", return_value=Path("/bin/nexttrace")), \
                 mock.patch.object(nm, "run_route_trace", return_value=payload) as trace, \
                 redirect_stdout(output):

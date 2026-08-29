@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Keep this in sync with VERSION in node_manager.py.
-MANAGER_VERSION="0.7.8"
+MANAGER_VERSION="0.7.9"
 update_requested=false
 if [ "${1:-}" = "--update" ]; then
   update_requested=true

@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.8"
+VERSION = "0.7.9"
 XRAY_VERSION = "26.7.28"
 NEXTTRACE_VERSION = "1.7.3"
 ACME_VERSION = "3.1.4"
@@ -120,6 +120,7 @@ ROUTE_CARRIERS = (
     ("cm", "中国移动"),
 )
 ROUTE_CARRIER_LABELS = dict(ROUTE_CARRIERS)
+MAX_ROUTE_TEST_ROUNDS = 5
 ROUTE_LINES = {
     "ct": (
         ("4809", "CN2", "China Telecom Next Generation"),
@@ -262,6 +263,19 @@ def prompt_port(text: str, default: int | None = None) -> int:
     if not 1 <= value <= 65535:
         raise InstallError(f"端口超出范围：{value}")
     return value
+
+
+def prompt_route_test_rounds() -> int:
+    raw = prompt(f"每个目标测试次数（1-{MAX_ROUTE_TEST_ROUNDS}）", "1")
+    try:
+        rounds = int(raw)
+    except ValueError as exc:
+        raise InstallError("测试次数必须是整数") from exc
+    if not 1 <= rounds <= MAX_ROUTE_TEST_ROUNDS:
+        raise InstallError(
+            f"测试次数超出范围：{rounds}（允许 1-{MAX_ROUTE_TEST_ROUNDS} 次）",
+        )
+    return rounds
 
 
 def normalize_node_identity(value: str) -> str:
@@ -1037,28 +1051,80 @@ def summarize_route_trace(carrier: str | None, payload: dict) -> dict[str, str]:
     }
 
 
+def summary_latency_ms(summary: dict[str, str]) -> float | None:
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*ms", summary.get("latency", ""))
+    return float(match.group(1)) if match else None
+
+
+def summarize_route_samples(
+    carrier: str | None,
+    payloads: list[dict],
+    total_rounds: int,
+) -> dict[str, str]:
+    """Choose a median-latency route and report repeated-test statistics."""
+    summaries = [summarize_route_trace(carrier, payload) for payload in payloads]
+    if total_rounds == 1 and len(summaries) == 1:
+        return summaries[0]
+    measured = [
+        (summary, latency)
+        for summary in summaries
+        if (latency := summary_latency_ms(summary)) is not None
+    ]
+    if measured:
+        values = [latency for _, latency in measured]
+        median = statistics.median(values)
+        representative = min(measured, key=lambda item: abs(item[1] - median))[0]
+        result = dict(representative)
+        result["latency"] = (
+            f"中位 {median:.1f} ms（成功 {len(values)}/{total_rounds} 次，"
+            f"范围 {min(values):.1f}-{max(values):.1f} ms）"
+        )
+    else:
+        result = dict(summaries[0])
+        result["latency"] = f"无响应（成功 {len(summaries)}/{total_rounds} 次）"
+
+    if any("（借道）" in summary["line"] for summary in summaries):
+        result["line"] = result["line"].replace("（借道）", "") + "（借道）"
+    return result
+
+
 def test_single_province_route() -> None:
     print("\n单节点线路/延迟测试（IPv4）")
     print("可输入省级简称（浙江、上海、黑龙江）或直接输入目标 IPv4。")
     print("中文严格匹配且不带“省/市”；IPv4 不校验归属地或运营商。")
     value = prompt("省份/直辖市/自治区简称或目标 IPv4")
     targets = route_test_targets(value)
+    rounds = prompt_route_test_rounds()
     binary = ensure_nexttrace()
     if targets[0][0] is None:
-        print(f"\n正在直接测试 {targets[0][2]}；每跳仅 1 次探测，请稍候...")
+        print(
+            f"\n正在直接测试 {targets[0][2]}；每跳仅 1 次探测，"
+            f"每个目标顺序测试 {rounds} 次，请稍候...",
+        )
     else:
-        print(f"\n正在测试 {value.strip()} 电信、联通、移动；每跳仅 1 次探测，请稍候...")
+        print(
+            f"\n正在测试 {value.strip()} 电信、联通、移动；每跳仅 1 次探测，"
+            f"每个目标顺序测试 {rounds} 次，请稍候...",
+        )
+    print("多次测试按顺序执行，不并发占用 NAT/LXC 的 CPU、带宽或 ICMP 配额。")
     print("GeoIP 仅作辅助；绕路结论会忽略孤立或不符合 RTT 的离谱标签。")
     for carrier, label, target in targets:
-        try:
-            summary = summarize_route_trace(carrier, run_route_trace(binary, target))
-            print(f"\n{label}  目标：{target}")
-            print(f"  线路：{summary['line']}｜{summary['name']}")
-            print(f"  延迟：{summary['latency']}")
-            print(f"  路径：{summary['as_path']}")
-            print(f"  绕路：{summary['detour']}")
-        except (InstallError, OSError, subprocess.SubprocessError) as exc:
-            print(f"\n{label}  测试失败：{exc}")
+        payloads = []
+        failures = []
+        for _ in range(rounds):
+            try:
+                payloads.append(run_route_trace(binary, target))
+            except (InstallError, OSError, subprocess.SubprocessError) as exc:
+                failures.append(exc)
+        if not payloads:
+            print(f"\n{label}  测试失败：{failures[-1]}")
+            continue
+        summary = summarize_route_samples(carrier, payloads, rounds)
+        print(f"\n{label}  目标：{target}")
+        print(f"  线路：{summary['line']}｜{summary['name']}")
+        print(f"  延迟：{summary['latency']}")
+        print(f"  路径：{summary['as_path']}")
+        print(f"  绕路：{summary['detour']}")
 
 
 def quic_settings() -> dict:
