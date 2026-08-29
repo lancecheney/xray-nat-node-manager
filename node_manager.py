@@ -31,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.7.3"
+VERSION = "0.7.4"
 XRAY_VERSION = "26.7.28"
 NEXTTRACE_VERSION = "1.7.3"
 ACME_VERSION = "3.1.4"
@@ -136,8 +136,23 @@ ROUTE_LINES = {
         ("58807", "CMIN2", "China Mobile International N2"),
         ("58453", "CMI", "China Mobile International"),
         ("9808", "CMNET", "中国移动骨干网"),
+        ("56041", "浙江省网", "中国移动浙江接入网"),
     ),
 }
+INTERNATIONAL_ROUTE_ASNS = {
+    "ct": frozenset({"4809"}),
+    "cu": frozenset({"9929", "10099"}),
+    "cm": frozenset({"58807", "58453"}),
+}
+INTERNATIONAL_ROUTE_ASN_SET = frozenset(
+    asn for asns in INTERNATIONAL_ROUTE_ASNS.values() for asn in asns
+)
+DOMESTIC_ROUTE_ASNS = frozenset(
+    asn
+    for carrier, lines in ROUTE_LINES.items()
+    for asn, _, _ in lines
+    if asn not in INTERNATIONAL_ROUTE_ASNS[carrier]
+)
 UNKNOWN_GEO_LABELS = {
     "", "unknown", "未知", "网络故障", "network error", "anycast",
 }
@@ -750,11 +765,30 @@ def trace_hop_asns(hop: dict) -> list[str]:
 
 
 def trace_path_asns(hops: list[dict]) -> list[str]:
-    path = []
+    return [asn for asn, _ in trace_path_entries(hops)]
+
+
+def trace_path_entries(hops: list[dict]) -> list[tuple[str, dict]]:
+    entries = []
     for hop in hops:
         for asn in trace_hop_asns(hop):
-            if not path or path[-1] != asn:
-                path.append(asn)
+            if not entries or entries[-1][0] != asn:
+                entries.append((asn, hop))
+    return entries
+
+
+def visible_route_path_asns(hops: list[dict]) -> list[str]:
+    """Return only confirmed international or non-China route segments."""
+    path = []
+    for asn, hop in trace_path_entries(hops):
+        if asn in INTERNATIONAL_ROUTE_ASN_SET:
+            path.append(asn)
+            continue
+        if asn in DOMESTIC_ROUTE_ASNS:
+            continue
+        location = normalized_hop_location(hop)
+        if location and location[0] != "CN":
+            path.append(asn)
     return path
 
 
@@ -771,28 +805,36 @@ def successful_trace_hops(payload: dict) -> list[dict]:
 
 
 def route_line(carrier: str, hops: list[dict]) -> tuple[str, str, str]:
-    path = trace_path_asns(hops)
-    matches = [line for line in ROUTE_LINES[carrier] if line[0] in path]
+    path = visible_route_path_asns(hops)
+    matches = []
+    seen = set()
+    for asn in path:
+        metadata = asn_line_metadata(asn)
+        if metadata and asn in INTERNATIONAL_ROUTE_ASN_SET and asn not in seen:
+            matches.append(metadata)
+            seen.add(asn)
     if not matches:
-        return "未识别", "未看到该运营商的典型骨干 ASN", " → ".join(f"AS{item}" for item in path) or "无公开 ASN"
+        return "未识别", "未看到该运营商的典型国际骨干 ASN", " → ".join(f"AS{item}" for item in path) or "无已识别国际路径"
     code = "+".join(item[1] for item in matches)
-    name = " + ".join(item[2] for item in matches)
+    name = " + ".join(f"{ROUTE_CARRIER_LABELS[item[0]]} {item[2]}" for item in matches)
     return code, name, " → ".join(f"AS{item}" for item in path)
 
 
 def route_line_any(hops: list[dict]) -> tuple[str, str, str]:
-    path = trace_path_asns(hops)
+    path = visible_route_path_asns(hops)
     matches = []
-    for carrier, label in ROUTE_CARRIERS:
-        for asn, code, name in ROUTE_LINES[carrier]:
-            if asn in path:
-                matches.append((code, f"{label} {name}"))
-    as_path = " → ".join(f"AS{item}" for item in path) or "无公开 ASN"
+    seen = set()
+    for asn in path:
+        metadata = asn_line_metadata(asn)
+        if metadata and asn in INTERNATIONAL_ROUTE_ASN_SET and asn not in seen:
+            matches.append(metadata)
+            seen.add(asn)
+    as_path = " → ".join(f"AS{item}" for item in path) or "无已识别国际路径"
     if not matches:
-        return "未识别", "未看到典型三网骨干 ASN", as_path
+        return "未识别", "未看到典型三网国际骨干 ASN", as_path
     return (
-        "+".join(item[0] for item in matches),
-        " + ".join(item[1] for item in matches),
+        "+".join(item[1] for item in matches),
+        " + ".join(f"{ROUTE_CARRIER_LABELS[item[0]]} {item[2]}" for item in matches),
         as_path,
     )
 
@@ -813,6 +855,15 @@ def format_asn_line(asn: str, metadata: tuple[str, str, str] | None = None) -> s
     return f"{ROUTE_CARRIER_LABELS[carrier]} {code}（AS{asn}）"
 
 
+def format_transit_asn(asn: str) -> str:
+    metadata = asn_line_metadata(asn)
+    if not metadata:
+        return f"AS{asn}"
+    if asn in INTERNATIONAL_ROUTE_ASNS[metadata[0]]:
+        return format_asn_line(asn, metadata)
+    return ROUTE_CARRIER_LABELS[metadata[0]]
+
+
 def route_transit(carrier: str, hops: list[dict]) -> str:
     path = trace_path_asns(hops)
     target_asns = {item[0] for item in ROUTE_LINES[carrier]}
@@ -830,8 +881,13 @@ def route_transit(carrier: str, hops: list[dict]) -> str:
     if not seen:
         return "未发现跨运营商借道证据"
     target_asn = path[last_target]
-    target_label = format_asn_line(target_asn)
-    borrowed = [format_asn_line(asn) for asn in seen]
+    target_metadata = asn_line_metadata(target_asn)
+    target_label = (
+        format_asn_line(target_asn, target_metadata)
+        if target_asn in INTERNATIONAL_ROUTE_ASN_SET
+        else f"{ROUTE_CARRIER_LABELS[carrier]} 目标"
+    )
+    borrowed = [format_transit_asn(asn) for asn in seen]
     return f"检测到借道：{'、'.join(borrowed)} → {target_label}"
 
 

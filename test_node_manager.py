@@ -897,10 +897,11 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         summary = nm.summarize_route_trace("ct", payload)
-        self.assertEqual(summary["line"], "CN2+163")
+        self.assertEqual(summary["line"], "CN2")
         self.assertIn("China Telecom Next Generation", summary["name"])
         self.assertEqual(summary["latency"], "18.2 ms")
-        self.assertEqual(summary["as_path"], "AS64500 → AS4809 → AS4134")
+        self.assertEqual(summary["as_path"], "AS64500 → AS4809")
+        self.assertNotIn("AS4134", summary["as_path"])
 
     def test_route_summary_reads_cn2_router_labels_before_terminal_asn(self):
         intermediate = self.hop("59.43.247.225", 65.6, "", "中国", "China", "上海")
@@ -916,9 +917,9 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         summary = nm.summarize_route_trace("ct", payload)
-        self.assertEqual(summary["line"], "CN2+上海省网")
+        self.assertEqual(summary["line"], "CN2")
         self.assertIn("AS4809", summary["as_path"])
-        self.assertIn("AS4812", summary["as_path"])
+        self.assertNotIn("AS4812", summary["as_path"])
 
     def test_terminal_shanghai_unicom_asn_is_reported_as_access_network(self):
         payload = {
@@ -926,8 +927,9 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         summary = nm.summarize_route_trace("cu", payload)
-        self.assertEqual(summary["line"], "上海省网")
-        self.assertIn("中国联通上海", summary["name"])
+        self.assertEqual(summary["line"], "未识别")
+        self.assertIn("典型国际骨干", summary["name"])
+        self.assertEqual(summary["as_path"], "无已识别国际路径")
 
     def test_unicom_path_reports_china_telecom_transit_as_borrowed(self):
         payload = {
@@ -941,9 +943,13 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         summary = nm.summarize_route_trace("cu", payload)
+        self.assertEqual(summary["line"], "CN2")
+        self.assertEqual(summary["as_path"], "AS4809")
+        self.assertNotIn("AS4837", summary["as_path"])
         self.assertIn("借道", summary["transit"])
         self.assertIn("中国电信", summary["transit"])
         self.assertIn("AS4809", summary["transit"])
+        self.assertNotIn("AS4837", summary["transit"])
 
     def test_singapore_to_hong_kong_to_shanghai_is_regional_transit(self):
         hops = [
@@ -967,10 +973,28 @@ class ProvinceRouteTests(unittest.TestCase):
             "StopReason": {"reason": "destination_reached"},
         }
         summary = nm.summarize_route_trace(None, payload)
-        self.assertEqual(summary["line"], "CN2+163")
+        self.assertEqual(summary["line"], "CN2")
         self.assertIn("中国电信", summary["name"])
         self.assertEqual(summary["latency"], "22.0 ms")
+        self.assertEqual(summary["as_path"], "AS64500 → AS4809")
+        self.assertNotIn("AS4134", summary["as_path"])
         self.assertIn("未发现可信绕路证据", summary["detour"])
+
+    def test_mobile_summary_hides_domestic_backbone_and_access_asns(self):
+        payload = {
+            "Hops": [
+                [self.hop("203.174.80.17", 2, "58453", "新加坡", "Singapore")],
+                [self.hop("221.183.89.69", 64, "9808", "中国", "China", "上海")],
+                # GeoIP 偶尔会把国内接入 ASN 标错；已知国内 ASN 仍不能泄露到国际路径。
+                [self.hop("112.13.92.194", 70, "56041", "英国", "United Kingdom")],
+            ],
+            "StopReason": {"reason": "destination_reached"},
+        }
+        summary = nm.summarize_route_trace("cm", payload)
+        self.assertEqual(summary["line"], "CMI")
+        self.assertEqual(summary["as_path"], "AS58453")
+        self.assertNotIn("AS9808", summary["as_path"])
+        self.assertNotIn("AS56041", summary["as_path"])
 
     def test_implausible_single_geoip_hop_is_not_called_a_detour(self):
         hops = [
